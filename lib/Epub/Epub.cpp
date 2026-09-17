@@ -153,19 +153,29 @@ bool cachedBmpMatchesDimensions(const std::string& path, const int width, const 
 }
 
 void releaseReaderSdFontCachesBeforeCoverDecode(const GfxRenderer* renderer, const int readerFontId,
-                                                const char* reason) {
+                                      const char* reason) {
   if (!renderer) return;
-  if (readerFontId <= 0) return;
-  if (!renderer->isSdCardFont(readerFontId)) return;
 
   const auto before = MemoryBudget::snapshot();
   if (!MemoryBudget::shouldReleaseSdFontCachesForEpubInlineImage(before)) return;
 
-  if (!renderer->releaseSdCardFontForLowMemory(readerFontId)) return;
+  // CJK UI fallback sizes are independent SD-card font objects. UI rendering can
+  // leave their mini glyph/bitmap arenas resident before Home generates cover
+  // thumbnails. Releasing only the reader font does not recover that heap, so
+  // clear every registered SD font cache before the image decoder's peak.
+  size_t released = 0;
+  for (const auto& entry : renderer->getSdCardFonts()) {
+    if (entry.second != nullptr && renderer->releaseSdCardFontForLowMemory(entry.first)) {
+      ++released;
+    }
+  }
+  if (released == 0) return;
 
   const auto after = MemoryBudget::snapshot();
-  LOG_DBG("EBP", "Released SD font caches before %s: free=%u->%u maxAlloc=%u->%u", reason, before.freeHeap,
-          after.freeHeap, before.maxAllocHeap, after.maxAllocHeap);
+  LOG_DBG("EBP", "Released %u SD font caches before %s: free=%u->%u maxAlloc=%u->%u",
+          static_cast<unsigned>(released), reason, before.freeHeap, after.freeHeap, before.maxAllocHeap,
+          after.maxAllocHeap);
+  (void)readerFontId;
 }
 
 std::string getThumbBmpPathForDimensions(const std::string& cachePath, int width, int height) {

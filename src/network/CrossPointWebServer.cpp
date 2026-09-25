@@ -24,15 +24,13 @@
 #include <iterator>
 #include <string_view>
 
+#include "AnnotationTagStore.h"
 #include "AppCapabilities.h"
 #include "AppVersion.h"
-#include "AnnotationTagStore.h"
 #include "ClippingStore.h"
 #include "CrossPointSettings.h"
-#include "FontInstaller.h"
 #include "FirmwareIdentity.h"
-#include "network/FirmwareFlasher.h"
-#include "network/OtaUpdater.h"
+#include "FontInstaller.h"
 #include "NoteStore.h"
 #include "OpdsServerStore.h"
 #include "QuickActions.h"
@@ -50,6 +48,8 @@
 #include "html/SettingsPageHtml.generated.h"
 #include "html/StyleCss.generated.h"
 #include "html/js/jszip_minJs.generated.h"
+#include "network/FirmwareFlasher.h"
+#include "network/OtaUpdater.h"
 #include "util/BookCacheUtils.h"
 #include "util/FontFamilyLabel.h"
 #include "util/StringUtils.h"
@@ -70,10 +70,10 @@ CrossPointWebServer* wsInstance = nullptr;
 size_t parseFirmwareSizeArg(WebServer* server, const char* name, const size_t fallback = 0) {
   if (server == nullptr || name == nullptr || !server->hasArg(name)) return fallback;
   const String value = server->arg(name);
-  if (value.isEmpty()) return fallback;
-  char* end = nullptr;
-  const unsigned long parsed = std::strtoul(value.c_str(), &end, 10);
-  return end != value.c_str() && end != nullptr && *end == '\0' ? static_cast<size_t>(parsed) : fallback;
+  size_t parsed = 0;
+  // Invalid supplied values must reject START, never silently become offset 0
+  // and erase an existing partial upload.
+  return firmware_request::parseSize(value.c_str(), parsed) ? parsed : std::numeric_limits<size_t>::max();
 }
 
 String firmwareStateField(const String& marker, const char* field) {
@@ -285,6 +285,9 @@ bool isProtectedPath(const String& path) {
 }
 }  // namespace
 
+static void sendStaticContent(WebServer* server, const char* data, size_t len, const char* etag,
+                              const char* contentType, bool gzip = true, const char* cacheControl = "no-cache");
+
 // File listing page template - now using generated headers:
 // - HomePageHtml (from html/HomePage.html)
 // - FilesPageHeaderHtml (from html/FilesPageHeader.html)
@@ -348,12 +351,16 @@ void CrossPointWebServer::begin() {
   server->on("/api/status", HTTP_GET, [this] { handleStatus(); });
   server->on("/firmware", HTTP_GET, [this] { handleFirmwarePage(); });
   server->on("/api/firmware/status", HTTP_GET, [this] { handleFirmwareStatus(); });
-  server->on("/api/firmware/upload", HTTP_POST, [this] { handleFirmwareUploadPost(); },
-             [this] { handleFirmwareUpload(); });
-  server->on("/api/firmware/signature", HTTP_POST, [this] { handleFirmwareSignatureUploadPost(); },
-             [this] { handleFirmwareSignatureUpload(); });
+  server->on(
+      "/api/firmware/upload", HTTP_POST, [this] { handleFirmwareUploadPost(); }, [this] { handleFirmwareUpload(); });
+  server->on(
+      "/api/firmware/signature", HTTP_POST, [this] { handleFirmwareSignatureUploadPost(); },
+      [this] { handleFirmwareSignatureUpload(); });
   server->on("/api/firmware/catalog", HTTP_GET, [this] { handleFirmwareCatalog(); });
   server->on("/api/firmware/download", HTTP_POST, [this] { handleFirmwareOfficialDownload(); });
+  server->on("/api/firmware/manual-download", HTTP_POST, [this] { handleFirmwareManualDownload(); });
+  server->on("/api/firmware/source", HTTP_GET, [this] { handleFirmwareSource(); });
+  server->on("/api/firmware/source", HTTP_POST, [this] { handleFirmwareSource(); });
   server->on("/api/firmware/install", HTTP_POST, [this] { handleFirmwareInstall(); });
   server->on("/api/firmware/cancel", HTTP_POST, [this] { handleFirmwareCancel(); });
   server->on("/api/files", HTTP_GET, [this] { handleFileListData(); });
@@ -382,8 +389,8 @@ void CrossPointWebServer::begin() {
   // Highlights and written notes. These use the academic ClippingStore v4
   // unchanged and keep note records in their own store.
   server->on("/highlights", HTTP_GET, [this] {
-    server->sendHeader("Content-Encoding", "gzip");
-    server->send_P(200, "text/html", HighlightsPageHtml, HighlightsPageHtmlCompressedSize);
+    sendStaticContent(server.get(), HighlightsPageHtml, HighlightsPageHtmlCompressedSize, HighlightsPageHtmlETag,
+                      "text/html");
   });
   server->on("/api/highlights", HTTP_GET, [this] { handleGetHighlights(); });
   server->on("/api/notes", HTTP_POST, [this] { handlePostNote(); });
@@ -407,8 +414,9 @@ void CrossPointWebServer::begin() {
   server->onNotFound([this] { handleNotFound(); });
 
   // Collect WebDAV headers and register handler
-  const char* davHeaders[] = {"Depth", "Destination", "Overwrite", "If", "Lock-Token", "Timeout"};
-  server->collectHeaders(davHeaders, 6);
+  const char* davHeaders[] = {"Depth",   "Destination", "Overwrite",     "If",   "Lock-Token",
+                              "Timeout", "Origin",      "If-None-Match", "Host", "X-Inkademic-Firmware"};
+  server->collectHeaders(davHeaders, 10);
   server->addHandler(new WebDAVHandler());  // Note: WebDAVHandler will be deleted by WebServer when server is stopped
 
   server->begin();
@@ -423,10 +431,9 @@ void CrossPointWebServer::begin() {
   udpActive = udp.begin(LOCAL_UDP_PORT);
   LOG_DBG("WEB", "Discovery UDP %s on port %d", udpActive ? "enabled" : "failed", LOCAL_UDP_PORT);
 
-  // Do not subscribe the serving task to the task watchdog. Arduino WebServer
-  // permits five-second client and ACK waits, which can consume the entire
-  // default watchdog window on a weak connection even while the CPU idle task
-  // is healthy. The system idle-task watchdog still detects real CPU stalls.
+  // The main Arduino task remains subscribed to its watchdog. The activity
+  // processes one request per outer loop pass so that task is fed between slow
+  // browser connections.
 
   running = true;
 
@@ -570,12 +577,26 @@ CrossPointWebServer::WsUploadStatus CrossPointWebServer::getWsUploadStatus() con
   return status;
 }
 
-static void sendHtmlContent(WebServer* server, const char* data, size_t len) {
-  server->sendHeader("Content-Encoding", "gzip");
-  server->send_P(200, "text/html", data, len);
+static void sendStaticContent(WebServer* server, const char* data, const size_t len, const char* etag,
+                              const char* contentType, const bool gzip, const char* cacheControl) {
+  // Static portal content lives in flash for the lifetime of this firmware.
+  // Revalidate by ETag so repeat navigation returns a small 304 response while
+  // a newly installed firmware immediately supplies its new page.
+  if (server->header("If-None-Match") == etag) {
+    server->sendHeader("ETag", etag);
+    server->sendHeader("Cache-Control", cacheControl);
+    server->send(304, contentType, "");
+    return;
+  }
+  if (gzip) server->sendHeader("Content-Encoding", "gzip");
+  server->sendHeader("ETag", etag);
+  server->sendHeader("Cache-Control", cacheControl);
+  server->send_P(200, contentType, data, len);
 }
 
-void CrossPointWebServer::handleRoot() const { sendHtmlContent(server.get(), HomePageHtml, sizeof(HomePageHtml)); }
+void CrossPointWebServer::handleRoot() const {
+  sendStaticContent(server.get(), HomePageHtml, HomePageHtmlCompressedSize, HomePageHtmlETag, "text/html");
+}
 
 const char* CrossPointWebServer::firmwareStateName(const FirmwareState state) {
   switch (state) {
@@ -609,6 +630,10 @@ void CrossPointWebServer::restoreFirmwareState() {
   return;
 #else
   const String marker = Storage.readFile(FIRMWARE_STATE_PATH);
+  firmwareManual = firmwareStateField(marker, "mode") == "manual";
+  firmwareCandidateDevice = firmwareStateField(marker, "device");
+  firmwareCandidateVersion = firmwareStateField(marker, "version");
+  firmwareCandidateSha256 = firmwareStateField(marker, "sha256");
   if (marker.startsWith("rebooting")) {
     firmwareState = FirmwareState::COMPLETED;
     firmwareError = "Firmware booted after the web update.";
@@ -638,9 +663,11 @@ void CrossPointWebServer::restoreFirmwareState() {
     HalFile file;
     if (Storage.openFileForRead("WEB", FIRMWARE_TEMP_PATH, file) && file) {
       firmwareUpload.received = file.fileSize();
-      firmwareUpload.total = firmwareUpload.received;
       file.close();
     }
+  } else if (marker.startsWith("manual_downloading")) {
+    firmwareState = FirmwareState::INTERRUPTED;
+    firmwareError = "The manual download was interrupted; download the image again.";
   } else if (marker.startsWith("official_downloading") && Storage.exists(FIRMWARE_TEMP_PATH)) {
     firmwareState = FirmwareState::UPLOADING;
     firmwareUpload.session = "official";
@@ -652,7 +679,8 @@ void CrossPointWebServer::restoreFirmwareState() {
       firmwareUploadTotal = firmwareUpload.total;
       file.close();
     }
-  } else if (marker.startsWith("ready") && Storage.exists(FIRMWARE_PATH) && Storage.exists(FIRMWARE_SIGNATURE_PATH)) {
+  } else if (marker.startsWith("ready") && Storage.exists(FIRMWARE_PATH) &&
+             (firmwareManual || Storage.exists(FIRMWARE_SIGNATURE_PATH))) {
     firmwareState = FirmwareState::READY;
     HalFile file;
     if (Storage.openFileForRead("WEB", FIRMWARE_PATH, file) && file) {
@@ -701,7 +729,9 @@ void CrossPointWebServer::resetFirmwareStaging(const bool removeReadyImage) {
   firmwareUpload.fileName = "";
   firmwareUpload.error = "";
   firmwareInstallPending = false;
-  firmwareOfficialDownloadPending = false;
+  firmwareDownloadPending = false;
+  firmwareManual = false;
+  manualUpdater.reset();
   firmwareSize = 0;
   firmwareWritten = 0;
   firmwareTotal = 0;
@@ -731,8 +761,7 @@ bool CrossPointWebServer::hasEnoughHeapForFirmwareUpdate(String& reason) const {
 }
 
 void CrossPointWebServer::handleFirmwarePage() const {
-  server->sendHeader("Content-Encoding", "gzip");
-  server->send_P(200, "text/html", FirmwarePageHtml, FirmwarePageHtmlCompressedSize);
+  sendStaticContent(server.get(), FirmwarePageHtml, FirmwarePageHtmlCompressedSize, FirmwarePageHtmlETag, "text/html");
 }
 
 void CrossPointWebServer::handleFirmwareStatus() const {
@@ -741,16 +770,20 @@ void CrossPointWebServer::handleFirmwareStatus() const {
   doc["version"] = INKADEMIC_VERSION;
   doc["device"] = firmware_identity::deviceType();
   doc["identity"] = firmware_identity::marker();
-  doc["received"] = firmwareUpload.active ? firmwareUpload.received : firmwareWritten;
+  doc["received"] = (firmwareState == FirmwareState::UPLOADING || firmwareState == FirmwareState::AWAITING_SIGNATURE)
+                        ? firmwareUpload.received
+                        : firmwareWritten;
+  doc["mode"] = firmwareManual ? "manual" : "signed";
   doc["size"] = firmwareSize;
   doc["total"] = firmwareUpload.total > 0 ? firmwareUpload.total : firmwareUploadTotal;
   doc["partitionLimit"] = firmwareUpload.partitionLimit;
   doc["session"] = firmwareUpload.session;
   doc["filename"] = firmwareUpload.fileName;
   doc["signaturePresent"] = Storage.exists(FIRMWARE_SIGNATURE_PATH) || Storage.exists(FIRMWARE_SIGNATURE_TEMP_PATH);
-  doc["signatureVerified"] = firmwareState == FirmwareState::READY;
+  doc["signatureVerified"] = !firmwareManual && firmwareState == FirmwareState::READY;
   doc["candidateDevice"] = firmwareCandidateDevice;
   doc["candidateVersion"] = firmwareCandidateVersion;
+  doc["candidateSha256"] = firmwareCandidateSha256;
   doc["freeHeap"] = ESP.getFreeHeap();
   doc["maxAllocHeap"] = ESP.getMaxAllocHeap();
   doc["installSupported"] =
@@ -766,6 +799,19 @@ void CrossPointWebServer::handleFirmwareStatus() const {
   server->send(200, "application/json", response);
 }
 
+bool CrossPointWebServer::firmwareRequestAllowed() const {
+  const String origin = server->header("Origin");
+  const String intent = server->header("X-Inkademic-Firmware");
+  const String host = server->header("Host");
+  return firmware_request::allowed(origin.c_str(), host.c_str(), intent.c_str());
+}
+
+bool CrossPointWebServer::requireFirmwareRequest() const {
+  if (firmwareRequestAllowed()) return true;
+  server->send(403, "application/json", "{\"error\":\"Open firmware controls on the reader's own web page.\"}");
+  return false;
+}
+
 void CrossPointWebServer::handleFirmwareUpload() {
 #ifdef SIMULATOR
   return;
@@ -773,66 +819,76 @@ void CrossPointWebServer::handleFirmwareUpload() {
   HTTPUpload& upload = server->upload();
 
   if (upload.status == UPLOAD_FILE_START) {
+    if (!firmwareRequest.start()) return;
+    if (!firmwareRequestAllowed()) {
+      firmwareRequest.reject("Firmware request origin or header rejected.");
+      return;
+    }
     if (firmwareUpload.active || firmwareInstallPending || firmwareState == FirmwareState::INSTALLING ||
-        firmwareOfficialDownloadPending) {
-      firmwareUpload.error = "A firmware transaction is already in progress.";
+        firmwareDownloadPending) {
+      firmwareRequest.reject("A firmware transaction is already in progress.");
       return;
     }
 
     String lowerName = upload.filename;
     lowerName.toLowerCase();
-    if (!lowerName.endsWith(".bin")) {
-      firmwareUpload.error = "Select an ESP firmware .bin file.";
-      firmwareState = FirmwareState::FAILED;
+    if (!lowerName.endsWith(".bin") || !firmware_request::validStateValue(upload.filename.c_str())) {
+      firmwareRequest.reject("Select an ESP firmware .bin file.");
       return;
     }
 
     String memoryError;
     if (!hasEnoughHeapForFirmwareUpdate(memoryError)) {
-      firmwareUpload.error = memoryError;
-      firmwareError = memoryError;
-      firmwareState = FirmwareState::FAILED;
-      writeFirmwareState("failed", firmwareError.c_str());
+      firmwareRequest.reject("Not enough memory for a firmware upload.");
       return;
     }
 
     const esp_partition_t* destination = esp_ota_get_next_update_partition(nullptr);
     if (!destination) {
-      firmwareUpload.error = "No OTA application partition is available.";
-      firmwareState = FirmwareState::FAILED;
+      firmwareRequest.reject("No OTA application partition is available.");
       return;
     }
 
+    const String mode = server->arg("mode");
+    if (!mode.isEmpty() && mode != "manual" && mode != "signed") {
+      firmwareRequest.reject("Unknown firmware installation mode.");
+      return;
+    }
+    const bool manual = mode == "manual";
     const size_t offset = parseFirmwareSizeArg(server.get(), "offset", 0);
     const size_t total = parseFirmwareSizeArg(server.get(), "total", upload.totalSize);
     String session = server->arg("session");
     if (session.isEmpty()) session = "legacy";
+    if (!firmware_request::validStateValue(session.c_str())) {
+      firmwareRequest.reject("Invalid upload session identifier.");
+      return;
+    }
 
+    if (total > destination->size || offset > destination->size || (total > 0 && offset > total)) {
+      firmwareRequest.reject("The upload size or offset exceeds the firmware limits.");
+      return;
+    }
     if (offset == 0) {
       resetFirmwareStaging(true);
+      firmwareManual = manual;
       firmwareUpload.session = session;
       firmwareUpload.fileName = upload.filename;
       firmwareUpload.total = total;
       firmwareUploadTotal = total;
       if (!Storage.openFileForWrite("WEBFW", FIRMWARE_TEMP_PATH, firmwareUpload.file)) {
-        firmwareUpload.error = "Could not create the temporary firmware file on the SD card.";
-        firmwareState = FirmwareState::FAILED;
+        firmwareRequest.reject("Could not create the temporary firmware file on the SD card.");
         return;
       }
     } else {
       if (firmwareState != FirmwareState::UPLOADING || firmwareUpload.session != session ||
-          firmwareUpload.received != offset || !Storage.exists(FIRMWARE_TEMP_PATH)) {
-        firmwareUpload.error = "The upload offset does not match the saved partial image.";
-        firmwareError = firmwareUpload.error;
-        firmwareState = FirmwareState::FAILED;
-        writeFirmwareState("failed", firmwareError.c_str());
+          firmwareUpload.received != offset || firmwareManual != manual || !Storage.exists(FIRMWARE_TEMP_PATH)) {
+        firmwareRequest.reject("The upload offset does not match the saved partial image.");
         return;
       }
       if (total > 0) firmwareUpload.total = total;
       firmwareUpload.file = Storage.open(FIRMWARE_TEMP_PATH, O_WRONLY | O_APPEND);
       if (!firmwareUpload.file) {
-        firmwareUpload.error = "Could not reopen the partial firmware image.";
-        firmwareState = FirmwareState::FAILED;
+        firmwareRequest.reject("Could not reopen the partial firmware image.");
         return;
       }
     }
@@ -840,18 +896,25 @@ void CrossPointWebServer::handleFirmwareUpload() {
     if (offset == 0) firmwareUpload.received = 0;
     firmwareUpload.error = "";
     firmwareUpload.active = true;
+    firmwareRequest.accept();
     firmwareState = FirmwareState::UPLOADING;
     firmwareError = "";
-    String stateDetail = "session=" + firmwareUpload.session + ";received=" + String(firmwareUpload.received) +
-                         ";total=" + String(firmwareUpload.total);
+    String stateDetail = "session=" + firmwareUpload.session + ";name=" + firmwareUpload.fileName +
+                         ";received=" + String(firmwareUpload.received) + ";total=" + String(firmwareUpload.total) +
+                         ";mode=" + (firmwareManual ? "manual" : "signed");
     writeFirmwareState("uploading", stateDetail.c_str());
+    return;
+  }
+
+  if (!firmwareRequest.accepted()) {
+    if (upload.status == UPLOAD_FILE_ABORTED) firmwareRequest.finish();
     return;
   }
 
   if (upload.status == UPLOAD_FILE_WRITE) {
     if (!firmwareUpload.active || !firmwareUpload.error.isEmpty()) return;
     const size_t nextSize = firmwareUpload.received + upload.currentSize;
-    if (nextSize > firmwareUpload.partitionLimit ||
+    if (nextSize < firmwareUpload.received || nextSize > firmwareUpload.partitionLimit ||
         (firmwareUpload.total > 0 && nextSize > firmwareUpload.total)) {
       firmwareUpload.error = "The image is larger than the next OTA partition.";
       firmwareUpload.file.close();
@@ -879,14 +942,21 @@ void CrossPointWebServer::handleFirmwareUpload() {
 
   if (upload.status != UPLOAD_FILE_END && upload.status != UPLOAD_FILE_ABORTED) return;
 
+  if (!firmwareUpload.active) {
+    if (upload.status == UPLOAD_FILE_ABORTED) firmwareRequest.finish();
+    return;
+  }
+
   if (upload.status == UPLOAD_FILE_ABORTED) {
+    firmwareRequest.finish();
     firmwareUpload.file.sync();
     firmwareUpload.file.close();
     firmwareUpload.active = false;
     firmwareState = FirmwareState::UPLOADING;
     firmwareError = "The connection stopped; the partial image was kept so the browser can resume it.";
-    String stateDetail = "session=" + firmwareUpload.session + ";received=" + String(firmwareUpload.received) +
-                         ";total=" + String(firmwareUpload.total);
+    String stateDetail = "session=" + firmwareUpload.session + ";name=" + firmwareUpload.fileName +
+                         ";received=" + String(firmwareUpload.received) + ";total=" + String(firmwareUpload.total) +
+                         ";mode=" + (firmwareManual ? "manual" : "signed");
     writeFirmwareState("uploading", stateDetail.c_str());
     return;
   }
@@ -895,8 +965,8 @@ void CrossPointWebServer::handleFirmwareUpload() {
   firmwareUpload.file.close();
   firmwareUpload.active = false;
   if (!synced || !firmwareUpload.error.isEmpty()) {
-    firmwareError = firmwareUpload.error.isEmpty() ? "The temporary firmware file could not be finalized." :
-                                                      firmwareUpload.error;
+    firmwareError =
+        firmwareUpload.error.isEmpty() ? "The temporary firmware file could not be finalized." : firmwareUpload.error;
     firmwareState = FirmwareState::FAILED;
     Storage.remove(FIRMWARE_TEMP_PATH);
     writeFirmwareState("failed", firmwareError.c_str());
@@ -905,8 +975,9 @@ void CrossPointWebServer::handleFirmwareUpload() {
 
   if (firmwareUpload.total > 0 && firmwareUpload.received != firmwareUpload.total) {
     firmwareState = FirmwareState::UPLOADING;
-    String stateDetail = "session=" + firmwareUpload.session + ";received=" + String(firmwareUpload.received) +
-                         ";total=" + String(firmwareUpload.total);
+    String stateDetail = "session=" + firmwareUpload.session + ";name=" + firmwareUpload.fileName +
+                         ";received=" + String(firmwareUpload.received) + ";total=" + String(firmwareUpload.total) +
+                         ";mode=" + (firmwareManual ? "manual" : "signed");
     writeFirmwareState("uploading", stateDetail.c_str());
     return;
   }
@@ -921,10 +992,15 @@ void CrossPointWebServer::handleFirmwareUpload() {
   }
 
   firmwareSize = firmwareUpload.received;
+  if (firmwareManual) {
+    finalizeFirmwareCandidate(FIRMWARE_TEMP_PATH, FIRMWARE_SIGNATURE_TEMP_PATH, firmwareSize, false);
+    return;
+  }
   firmwareError = "";
   firmwareState = FirmwareState::AWAITING_SIGNATURE;
   const String stateDetail = String("session=") + firmwareUpload.session + ";name=" + firmwareUpload.fileName +
-                             ";received=" + String(firmwareUpload.received) + ";total=" + String(firmwareUpload.total);
+                             ";received=" + String(firmwareUpload.received) + ";total=" + String(firmwareUpload.total) +
+                             ";mode=" + (firmwareManual ? "manual" : "signed");
   writeFirmwareState("awaiting_signature", stateDetail.c_str());
 #endif
 }
@@ -933,6 +1009,21 @@ void CrossPointWebServer::handleFirmwareUploadPost() {
 #ifdef SIMULATOR
   server->send(501, "application/json", "{\"error\":\"Firmware updates are not available in the simulator.\"}");
 #else
+  const auto request = firmwareRequest;
+  firmwareRequest.finish();
+  if (!requireFirmwareRequest()) return;
+  if (request.error()) {
+    JsonDocument error;
+    error["error"] = request.error();
+    String response;
+    serializeJson(error, response);
+    server->send(409, "application/json", response);
+    return;
+  }
+  if (!request.accepted()) {
+    server->send(400, "application/json", "{\"error\":\"No firmware file received in this request.\"}");
+    return;
+  }
   JsonDocument doc;
   doc["state"] = firmwareStateName(firmwareState);
   doc["size"] = firmwareSize;
@@ -941,8 +1032,8 @@ void CrossPointWebServer::handleFirmwareUploadPost() {
   if (!firmwareError.isEmpty()) doc["error"] = firmwareError;
   String response;
   serializeJson(doc, response);
-  const bool accepted = firmwareState == FirmwareState::UPLOADING || firmwareState == FirmwareState::AWAITING_SIGNATURE ||
-                        firmwareState == FirmwareState::READY;
+  const bool accepted = firmwareState == FirmwareState::UPLOADING ||
+                        firmwareState == FirmwareState::AWAITING_SIGNATURE || firmwareState == FirmwareState::READY;
   server->send(accepted ? 200 : 400, "application/json", response);
 #endif
 }
@@ -966,9 +1057,11 @@ bool CrossPointWebServer::finalizeFirmwareCandidate(const char* imagePath, const
 
   char candidateDevice[32] = {};
   char candidateVersion[64] = {};
+  uint8_t candidateDigest[32];
   const auto validation = firmware_flash::validateBrowserImageFile(
       imagePath, destination->size, firmware_identity::deviceType(), INKADEMIC_VERSION, signaturePath, candidateDevice,
-      sizeof(candidateDevice), candidateVersion, sizeof(candidateVersion));
+      sizeof(candidateDevice), candidateVersion, sizeof(candidateVersion), candidateDigest,
+      firmwareManual ? firmware_flash::ValidationPolicy::Manual : firmware_flash::ValidationPolicy::SignedRelease);
   if (validation != firmware_flash::Result::OK) {
     firmwareError = String("Firmware validation failed: ") + firmware_flash::resultName(validation);
     firmwareState = FirmwareState::FAILED;
@@ -996,7 +1089,8 @@ bool CrossPointWebServer::finalizeFirmwareCandidate(const char* imagePath, const
     writeFirmwareState("failed", firmwareError.c_str());
     return false;
   }
-  if (!Storage.rename(imagePath, FIRMWARE_PATH) || !Storage.rename(signaturePath, FIRMWARE_SIGNATURE_PATH)) {
+  if (!Storage.rename(imagePath, FIRMWARE_PATH) ||
+      (!firmwareManual && !Storage.rename(signaturePath, FIRMWARE_SIGNATURE_PATH))) {
     Storage.remove(FIRMWARE_PATH);
     Storage.remove(FIRMWARE_SIGNATURE_PATH);
     if (hadReadyImage) Storage.rename(FIRMWARE_BACKUP_PATH, FIRMWARE_PATH);
@@ -1016,10 +1110,14 @@ bool CrossPointWebServer::finalizeFirmwareCandidate(const char* imagePath, const
   firmwareTotal = imageSize;
   firmwareCandidateDevice = candidateDevice;
   firmwareCandidateVersion = candidateVersion;
+  char digestHex[65];
+  for (size_t i = 0; i < 32; ++i) snprintf(digestHex + i * 2, 3, "%02x", candidateDigest[i]);
+  firmwareCandidateSha256 = digestHex;
   firmwareError = "";
   firmwareState = FirmwareState::READY;
   const String detail = String("version=") + candidateVersion + ";device=" + candidateDevice +
-                        ";source=" + (fromOfficial ? "official" : "browser") + ";signature=ed25519";
+                        ";source=" + (fromOfficial ? "official" : "browser") +
+                        ";mode=" + (firmwareManual ? "manual" : "signed") + ";sha256=" + firmwareCandidateSha256;
   writeFirmwareState("ready", detail.c_str());
   return true;
 #endif
@@ -1031,13 +1129,20 @@ void CrossPointWebServer::handleFirmwareSignatureUpload() {
 #else
   HTTPUpload& upload = server->upload();
   if (upload.status == UPLOAD_FILE_START) {
-    if (firmwareState != FirmwareState::AWAITING_SIGNATURE || firmwareInstallPending || firmwareOfficialDownloadPending) {
-      firmwareError = "Upload the complete firmware image before its signature.";
+    if (!signatureRequest.start()) return;
+    if (!firmwareRequestAllowed()) {
+      signatureRequest.reject("Firmware request origin or header rejected.");
+      return;
+    }
+    if (firmwareManual || firmwareState != FirmwareState::AWAITING_SIGNATURE || firmwareInstallPending ||
+        firmwareDownloadPending) {
+      signatureRequest.reject("Upload the complete firmware image before its signature.");
       return;
     }
     firmwareSignatureFile.close();
     Storage.remove(FIRMWARE_SIGNATURE_TEMP_PATH);
     if (!Storage.openFileForWrite("WEBFWSIG", FIRMWARE_SIGNATURE_TEMP_PATH, firmwareSignatureFile)) {
+      signatureRequest.reject("Could not create the temporary signature file on the SD card.");
       firmwareError = "Could not create the temporary signature file on the SD card.";
       firmwareState = FirmwareState::AWAITING_SIGNATURE;
       writeFirmwareState("awaiting_signature", "signature=retry");
@@ -1045,8 +1150,14 @@ void CrossPointWebServer::handleFirmwareSignatureUpload() {
     }
     firmwareSignatureReceived = 0;
     firmwareSignatureActive = true;
+    signatureRequest.accept();
     return;
   }
+  if (!signatureRequest.accepted() || !firmwareSignatureActive) {
+    if (upload.status == UPLOAD_FILE_ABORTED) signatureRequest.finish();
+    return;
+  }
+
   if (upload.status == UPLOAD_FILE_WRITE) {
     if (!firmwareSignatureActive) return;
     if (firmwareSignatureReceived + upload.currentSize > FIRMWARE_SIGNATURE_SIZE) {
@@ -1070,6 +1181,7 @@ void CrossPointWebServer::handleFirmwareSignatureUpload() {
     return;
   }
   if (upload.status == UPLOAD_FILE_ABORTED) {
+    signatureRequest.finish();
     firmwareSignatureFile.close();
     firmwareSignatureActive = false;
     Storage.remove(FIRMWARE_SIGNATURE_TEMP_PATH);
@@ -1097,6 +1209,17 @@ void CrossPointWebServer::handleFirmwareSignatureUploadPost() {
 #ifdef SIMULATOR
   server->send(501, "application/json", "{\"error\":\"Firmware updates are not available in the simulator.\"}");
 #else
+  const auto request = signatureRequest;
+  signatureRequest.finish();
+  if (!requireFirmwareRequest()) return;
+  if (request.error()) {
+    server->send(409, "application/json", "{\"error\":\"Signature upload rejected; staged image retained.\"}");
+    return;
+  }
+  if (!request.accepted()) {
+    server->send(400, "application/json", "{\"error\":\"No firmware file received in this request.\"}");
+    return;
+  }
   JsonDocument doc;
   doc["state"] = firmwareStateName(firmwareState);
   if (!firmwareError.isEmpty()) doc["error"] = firmwareError;
@@ -1107,12 +1230,20 @@ void CrossPointWebServer::handleFirmwareSignatureUploadPost() {
 }
 
 void CrossPointWebServer::handleFirmwareInstall() {
+  if (!requireFirmwareRequest()) return;
 #ifdef SIMULATOR
   server->send(501, "application/json", "{\"error\":\"Firmware updates are not available in the simulator.\"}");
 #else
   if (firmwareState != FirmwareState::READY || !Storage.exists(FIRMWARE_PATH) ||
-      !Storage.exists(FIRMWARE_SIGNATURE_PATH)) {
-    server->send(409, "application/json", "{\"error\":\"Upload, sign, and validate a firmware image first.\"}");
+      (!firmwareManual && !Storage.exists(FIRMWARE_SIGNATURE_PATH))) {
+    server->send(409, "application/json", "{\"error\":\"Upload and validate a firmware image first.\"}");
+    return;
+  }
+  if (firmwareCandidateSha256.length() != 64 || server->arg("sha256") != firmwareCandidateSha256 ||
+      server->arg("mode") != (firmwareManual ? "manual" : "signed")) {
+    server->send(409, "application/json",
+                 "{\"error\":\"The selected image changed or needs validation. Upload or download it again before "
+                 "installing.\"}");
     return;
   }
   if (firmwareInstallPending || firmwareState == FirmwareState::INSTALLING) {
@@ -1132,11 +1263,14 @@ void CrossPointWebServer::handleFirmwareInstall() {
   firmwareError = "";
   const String detail = String("version=") + firmwareCandidateVersion + ";device=" + firmwareCandidateDevice;
   writeFirmwareState("queued", detail.c_str());
-  server->send(202, "application/json", "{\"state\":\"install_requested\",\"message\":\"The device will install the validated image and reboot.\"}");
+  server->send(
+      202, "application/json",
+      "{\"state\":\"install_requested\",\"message\":\"The device will install the validated image and reboot.\"}");
 #endif
 }
 
 void CrossPointWebServer::handleFirmwareCatalog() {
+  if (!requireFirmwareRequest()) return;
 #ifdef SIMULATOR
   server->send(501, "application/json", "{\"error\":\"The official catalog is unavailable in the simulator.\"}");
 #else
@@ -1174,10 +1308,11 @@ void CrossPointWebServer::handleFirmwareCatalog() {
 }
 
 void CrossPointWebServer::handleFirmwareOfficialDownload() {
+  if (!requireFirmwareRequest()) return;
 #ifdef SIMULATOR
   server->send(501, "application/json", "{\"error\":\"Firmware updates are unavailable in the simulator.\"}");
 #else
-  if (firmwareOfficialDownloadPending || firmwareInstallPending || firmwareState == FirmwareState::INSTALLING) {
+  if (firmwareDownloadPending || firmwareInstallPending || firmwareState == FirmwareState::INSTALLING) {
     server->send(409, "application/json", "{\"error\":\"A firmware transaction is already in progress.\"}");
     return;
   }
@@ -1202,16 +1337,101 @@ void CrossPointWebServer::handleFirmwareOfficialDownload() {
   firmwareUpload.fileName = String("official-") + officialUpdater->getLatestVersion().c_str() + ".bin";
   firmwareUpload.total = officialUpdater->getOtaSize();
   firmwareUploadTotal = firmwareUpload.total;
-  firmwareOfficialDownloadPending = true;
+  firmwareDownloadPending = true;
   firmwareState = FirmwareState::UPLOADING;
   firmwareError = "";
-  const String stateDetail = String("name=") + firmwareUpload.fileName + ";total=" + String(firmwareUpload.total);
+  const String stateDetail = String("name=") + firmwareUpload.fileName + ";total=" + String(firmwareUpload.total) +
+                             ";mode=" + (firmwareManual ? "manual" : "signed");
   writeFirmwareState("official_downloading", stateDetail.c_str());
   server->send(202, "application/json", "{\"state\":\"uploading\",\"source\":\"official\"}");
 #endif
 }
 
+void CrossPointWebServer::handleFirmwareManualDownload() {
+  if (!requireFirmwareRequest()) return;
+#ifdef SIMULATOR
+  server->send(501, "application/json", "{\"error\":\"Firmware updates are unavailable in the simulator.\"}");
+#else
+  if (firmwareDownloadPending || firmwareInstallPending || firmwareUpload.active || firmwareSignatureActive ||
+      firmwareState == FirmwareState::INSTALLING) {
+    server->send(409, "application/json", "{\"error\":\"A firmware transaction is already in progress.\"}");
+    return;
+  }
+  const String url = server->arg("url");
+  if (server->arg("mode") != "manual" || !firmware_request::validManualUrl(url.c_str())) {
+    server->send(400, "application/json", "{\"error\":\"Choose manual mode and a direct HTTP(S) firmware URL.\"}");
+    return;
+  }
+  String memoryError;
+  if (!hasEnoughHeapForFirmwareUpdate(memoryError)) {
+    server->send(503, "application/json", "{\"error\":\"Close the reader and retry with more free memory.\"}");
+    return;
+  }
+  // One updater (bounded URL <= 1024 bytes), retained until download completes;
+  // it cannot live on this request's stack because work runs after the response.
+  auto updater = makeUniqueNoThrow<OtaUpdater>();
+  if (!updater) {
+    LOG_ERR("WEBFW", "OOM creating manual OTA updater");
+    server->send(503, "application/json", "{\"error\":\"Not enough memory for firmware download.\"}");
+    return;
+  }
+  if (!updater->setManualSource(url.c_str())) {
+    server->send(400, "application/json", "{\"error\":\"Invalid firmware URL.\"}");
+    return;
+  }
+  resetFirmwareStaging(true);
+  manualUpdater = std::move(updater);
+  firmwareManual = true;
+  firmwareUpload.fileName = "manual-ota.bin";
+  firmwareDownloadPending = true;
+  firmwareState = FirmwareState::UPLOADING;
+  firmwareError = "";
+  writeFirmwareState("manual_downloading", "mode=manual");
+  server->send(202, "application/json", "{\"state\":\"uploading\",\"mode\":\"manual\"}");
+#endif
+}
+
+void CrossPointWebServer::handleFirmwareSource() {
+  if (!requireFirmwareRequest()) return;
+#ifdef SIMULATOR
+  server->send(501, "application/json", "{\"error\":\"OTA sources are unavailable in the simulator.\"}");
+#else
+  if (server->method() == HTTP_POST) {
+    const String mode = server->arg("mode");
+    const String url = server->arg("url");
+    if (mode == "official") {
+      if (Storage.exists(OtaUpdater::MANUAL_SOURCE_PATH) && !Storage.remove(OtaUpdater::MANUAL_SOURCE_PATH)) {
+        server->send(500, "application/json", "{\"error\":\"Could not restore the official OTA source.\"}");
+        return;
+      }
+    } else if (mode == "manual" && firmware_request::validManualUrl(url.c_str())) {
+      if (!Storage.writeFile(OtaUpdater::MANUAL_SOURCE_PATH, url)) {
+        server->send(500, "application/json", "{\"error\":\"Could not save the OTA source.\"}");
+        return;
+      }
+    } else {
+      server->send(400, "application/json",
+                   "{\"error\":\"Choose the official source or a direct HTTP(S) firmware URL.\"}");
+      return;
+    }
+  }
+  OtaUpdater source;
+  if (source.loadSavedSource() != OtaUpdater::OK) {
+    server->send(400, "application/json",
+                 "{\"error\":\"Saved OTA source is invalid. Save a new URL or restore the official source.\"}");
+    return;
+  }
+  JsonDocument doc;
+  doc["mode"] = source.isManualSource() ? "manual" : "official";
+  doc["url"] = source.getLatestUrl();
+  String response;
+  serializeJson(doc, response);
+  server->send(200, "application/json", response);
+#endif
+}
+
 void CrossPointWebServer::handleFirmwareCancel() {
+  if (!requireFirmwareRequest()) return;
   if (firmwareState == FirmwareState::INSTALLING || firmwareState == FirmwareState::REBOOTING) {
     server->send(409, "application/json", "{\"error\":\"The firmware is already being installed.\"}");
     return;
@@ -1232,20 +1452,25 @@ void CrossPointWebServer::firmwareProgress(const size_t written, const size_t to
 
 void CrossPointWebServer::officialFirmwareProgress(void* context) {
   auto* self = static_cast<CrossPointWebServer*>(context);
-  if (self == nullptr || !self->officialUpdater) return;
-  self->firmwareWritten = self->officialUpdater->getProcessedSize();
-  self->firmwareTotal = self->officialUpdater->getTotalSize();
+  if (self == nullptr) return;
+  auto* updater = self->firmwareManual ? self->manualUpdater.get() : self->officialUpdater.get();
+  if (!updater) return;
+  self->firmwareWritten = updater->getProcessedSize();
+  self->firmwareTotal = updater->getTotalSize();
+  self->firmwareUpload.received = self->firmwareWritten;
+  self->firmwareUpload.total = self->firmwareTotal;
 }
 
 void CrossPointWebServer::processPendingFirmwareDownload() {
 #ifdef SIMULATOR
   return;
 #else
-  if (!firmwareOfficialDownloadPending) return;
-  firmwareOfficialDownloadPending = false;
-  if (!officialUpdater) {
+  if (!firmwareDownloadPending) return;
+  firmwareDownloadPending = false;
+  auto* updater = firmwareManual ? manualUpdater.get() : officialUpdater.get();
+  if (!updater) {
     firmwareState = FirmwareState::FAILED;
-    firmwareError = "The official update session was lost; check the catalog again.";
+    firmwareError = "The download session was lost; choose the firmware source again.";
     writeFirmwareState("failed", firmwareError.c_str());
     return;
   }
@@ -1253,11 +1478,12 @@ void CrossPointWebServer::processPendingFirmwareDownload() {
   firmwareWritten = 0;
   firmwareTotal = firmwareUpload.total;
   delay(100);
-  const auto result = officialUpdater->downloadLatestToFiles(FIRMWARE_TEMP_PATH, FIRMWARE_SIGNATURE_TEMP_PATH,
-                                                              officialFirmwareProgress, this);
+  const auto result = firmwareManual ? updater->downloadManualToFile(FIRMWARE_TEMP_PATH, officialFirmwareProgress, this)
+                                     : updater->downloadLatestToFiles(FIRMWARE_TEMP_PATH, FIRMWARE_SIGNATURE_TEMP_PATH,
+                                                                      officialFirmwareProgress, this);
   if (result != OtaUpdater::OK) {
     firmwareState = FirmwareState::FAILED;
-    firmwareError = String("Official firmware download failed: code=") + String(static_cast<int>(result));
+    firmwareError = String("Firmware download failed: code=") + String(static_cast<int>(result));
     writeFirmwareState("failed", firmwareError.c_str());
     return;
   }
@@ -1265,13 +1491,14 @@ void CrossPointWebServer::processPendingFirmwareDownload() {
   HalFile image;
   if (!Storage.openFileForRead("WEBFW", FIRMWARE_TEMP_PATH, image) || !image) {
     firmwareState = FirmwareState::FAILED;
-    firmwareError = "The official firmware file could not be reopened.";
+    firmwareError = "The downloaded firmware file could not be reopened.";
     writeFirmwareState("failed", firmwareError.c_str());
     return;
   }
   firmwareSize = image.fileSize();
   image.close();
-  finalizeFirmwareCandidate(FIRMWARE_TEMP_PATH, FIRMWARE_SIGNATURE_TEMP_PATH, firmwareSize, true);
+  finalizeFirmwareCandidate(FIRMWARE_TEMP_PATH, FIRMWARE_SIGNATURE_TEMP_PATH, firmwareSize, !firmwareManual);
+  manualUpdater.reset();
 #endif
 }
 
@@ -1302,11 +1529,13 @@ void CrossPointWebServer::processPendingFirmwareInstall() {
     writeFirmwareState("failed", firmwareError.c_str());
     return;
   }
+  uint8_t authenticatedDigest[32];
   char candidateDevice[32] = {};
   char candidateVersion[64] = {};
   const auto finalValidation = firmware_flash::validateBrowserImageFile(
       FIRMWARE_PATH, destination->size, firmware_identity::deviceType(), INKADEMIC_VERSION, FIRMWARE_SIGNATURE_PATH,
-      candidateDevice, sizeof(candidateDevice), candidateVersion, sizeof(candidateVersion));
+      candidateDevice, sizeof(candidateDevice), candidateVersion, sizeof(candidateVersion), authenticatedDigest,
+      firmwareManual ? firmware_flash::ValidationPolicy::Manual : firmware_flash::ValidationPolicy::SignedRelease);
   if (finalValidation != firmware_flash::Result::OK) {
     firmwareState = FirmwareState::FAILED;
     firmwareError = String("Final firmware validation failed: ") + firmware_flash::resultName(finalValidation);
@@ -1314,10 +1543,19 @@ void CrossPointWebServer::processPendingFirmwareInstall() {
     return;
   }
 
+  char digestHex[65];
+  for (size_t i = 0; i < 32; ++i) snprintf(digestHex + i * 2, 3, "%02x", authenticatedDigest[i]);
+  if (firmwareManual && firmwareCandidateSha256 != digestHex) {
+    firmwareState = FirmwareState::FAILED;
+    firmwareError = "The staged file changed; upload or download it again before installing.";
+    writeFirmwareState("failed", firmwareError.c_str());
+    return;
+  }
+
   // Let the HTTP response leave the socket before the long flash transaction
   // blocks this activity's request loop.
   delay(150);
-  const auto result = firmware_flash::flashFromSdPath(FIRMWARE_PATH, firmwareProgress, this, true);
+  const auto result = firmware_flash::flashFromSdPath(FIRMWARE_PATH, firmwareProgress, this, true, authenticatedDigest);
   if (result != firmware_flash::Result::OK) {
     firmwareState = FirmwareState::FAILED;
     firmwareError = String("Firmware installation failed: ") + firmware_flash::resultName(result);
@@ -1333,22 +1571,19 @@ void CrossPointWebServer::processPendingFirmwareInstall() {
 }
 
 void CrossPointWebServer::handleJszip() const {
-  server->sendHeader("Content-Encoding", "gzip");
-  server->send_P(200, "application/javascript", jszip_minJs, jszip_minJsCompressedSize);
+  sendStaticContent(server.get(), jszip_minJs, jszip_minJsCompressedSize, jszip_minJsETag, "application/javascript");
 }
 
 // Shared stylesheet and logo are referenced with a content-hashed ?v= query,
 // so they can be cached aggressively: a new build changes the URL.
 void CrossPointWebServer::handleStyleCss() const {
-  server->sendHeader("Content-Encoding", "gzip");
-  server->sendHeader("Cache-Control", "public, max-age=31536000, immutable");
-  server->send_P(200, "text/css", StyleCss, StyleCssCompressedSize);
+  sendStaticContent(server.get(), StyleCss, StyleCssCompressedSize, StyleCssETag, "text/css", true,
+                    "public, max-age=31536000, immutable");
 }
 
 void CrossPointWebServer::handleLogo() const {
-  // Raw PNG (already compressed); no Content-Encoding.
-  server->sendHeader("Cache-Control", "public, max-age=31536000, immutable");
-  server->send_P(200, "image/png", LogoPng, LogoPngSize);
+  sendStaticContent(server.get(), LogoPng, LogoPngSize, LogoPngETag, "image/png", false,
+                    "public, max-age=31536000, immutable");
 }
 
 void CrossPointWebServer::handleNotFound() const {
@@ -1472,7 +1707,7 @@ void CrossPointWebServer::scanFiles(const char* path, const FileVisitor visitor,
 bool CrossPointWebServer::isEpubFile(const String& filename) const { return FsHelpers::hasEpubExtension(filename); }
 
 void CrossPointWebServer::handleFileList() const {
-  sendHtmlContent(server.get(), FilesPageHtml, sizeof(FilesPageHtml));
+  sendStaticContent(server.get(), FilesPageHtml, FilesPageHtmlCompressedSize, FilesPageHtmlETag, "text/html");
 }
 
 void CrossPointWebServer::handleFileListData() const {
@@ -2090,7 +2325,7 @@ void CrossPointWebServer::handleDelete() const {
 }
 
 void CrossPointWebServer::handleSettingsPage() const {
-  sendHtmlContent(server.get(), SettingsPageHtml, sizeof(SettingsPageHtml));
+  sendStaticContent(server.get(), SettingsPageHtml, SettingsPageHtmlCompressedSize, SettingsPageHtmlETag, "text/html");
 }
 
 void CrossPointWebServer::handleGetSettings() const {
@@ -2753,7 +2988,7 @@ void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* 
 // --- Font management handlers ---
 
 void CrossPointWebServer::handleFontsPage() const {
-  sendHtmlContent(server.get(), FontsPageHtml, sizeof(FontsPageHtml));
+  sendStaticContent(server.get(), FontsPageHtml, FontsPageHtmlCompressedSize, FontsPageHtmlETag, "text/html");
 }
 
 void CrossPointWebServer::handleFontList() const {
@@ -3001,8 +3236,8 @@ void CrossPointWebServer::handleGetHighlights() const {
   JsonDocument doc;
   for (size_t i = 0; i < clippings.size(); ++i) {
     const Clipping& clipping = clippings[i];
-    const Note* note = NOTES.getNoteForClipping(clipping.spineIndex, clipping.startPage,
-                                                 clipping.startWordIndex, clipping.timestamp);
+    const Note* note =
+        NOTES.getNoteForClipping(clipping.spineIndex, clipping.startPage, clipping.startWordIndex, clipping.timestamp);
     std::string text;
     CLIPPINGS.readClippingText(i, text);
     doc.clear();
@@ -3089,9 +3324,9 @@ void CrossPointWebServer::handlePostNote() {
   NOTES.loadForBook(path.c_str(), "epub");
   const bool hasTag = doc["tagId"].is<JsonVariant>();
   const bool ok = (text.empty() && (!hasTag || tagId == 0))
-                     ? NOTES.deleteNote(path.c_str(), spineIndex, startPage, startWordIndex, clippingTimestamp)
-                     : NOTES.saveNoteAndTag(path.c_str(), spineIndex, startPage, startWordIndex, clippingTimestamp,
-                                            text.c_str(), tagId, hasTag);
+                      ? NOTES.deleteNote(path.c_str(), spineIndex, startPage, startWordIndex, clippingTimestamp)
+                      : NOTES.saveNoteAndTag(path.c_str(), spineIndex, startPage, startWordIndex, clippingTimestamp,
+                                             text.c_str(), tagId, hasTag);
   NOTES.unload();
 
   if (!ok) {

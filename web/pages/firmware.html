@@ -1,18 +1,25 @@
 <div class="card">
   <h2>Firmware update</h2>
   <p class="firmware-warning">
-    Use only an INKademic image built for this device. The image is uploaded to a temporary SD-card file,
-    validated completely, and only then made eligible for installation. Release images must include the matching
-    Ed25519 <code>.sig</code> file.
+    Choose a firmware built for your device. Official INKademic updates verify the release signature.
+    Manual installation also accepts other projects: it checks the image integrity, chip and size,
+    without requiring an INKademic signature.
   </p>
 
   <div class="firmware-status" id="firmware-status">Checking device…</div>
 
   <div class="firmware-upload">
+    <label for="firmware-mode">Installation mode</label>
+    <select id="firmware-mode">
+      <option value="signed">Official INKademic image (signed)</option>
+      <option value="manual">Manual image / another project</option>
+    </select>
     <label for="firmware-file">Firmware image (.bin)</label>
     <input id="firmware-file" type="file" accept=".bin,application/octet-stream" />
-    <label for="firmware-signature-file">Release signature (.sig, 64 bytes)</label>
-    <input id="firmware-signature-file" type="file" accept=".sig,application/octet-stream" />
+    <div id="firmware-signature-group">
+      <label for="firmware-signature-file">Release signature (.sig, 64 bytes)</label>
+      <input id="firmware-signature-file" type="file" accept=".sig,application/octet-stream" />
+    </div>
     <button class="save-btn" id="firmware-upload-btn" type="button">Upload and validate</button>
   </div>
 
@@ -20,6 +27,20 @@
     <button class="save-btn" id="firmware-check-btn" type="button">Check official signed release</button>
     <button class="save-btn" id="firmware-download-btn" type="button" disabled>Download official release to device</button>
     <div id="firmware-official-status"></div>
+  </div>
+
+  <div class="firmware-manual-ota">
+    <h3>Manual OTA / another project</h3>
+    <p>The reader downloads the image directly over Wi-Fi. Choose the link for your exact model.
+      Its origin is not verified with the INKademic signing key.</p>
+    <label for="firmware-url">Direct firmware URL (.bin)</label>
+    <input id="firmware-url" type="url" maxlength="1024" placeholder="https://…/firmware.bin" />
+    <button class="save-btn" id="firmware-manual-download-btn" type="button">Download and validate on device</button>
+    <div class="firmware-actions">
+      <button class="btn-small" id="firmware-source-save-btn" type="button">Use this link in the device OTA menu</button>
+      <button class="btn-small" id="firmware-source-official-btn" type="button">Use official source in OTA menu</button>
+    </div>
+    <p id="firmware-source-status" role="status"></p>
   </div>
 
   <div class="firmware-progress" id="firmware-progress-wrap" hidden>
@@ -34,7 +55,7 @@
 
   <p class="firmware-help">
     Interrupted browser uploads resume from the last confirmed block. Keep the device powered during installation.
-    A failed or interrupted write leaves the active firmware slot intact. The browser connection will close when the
+    The current firmware slot is retained until the new image has been written and checked. The browser connection will close when the
     device reboots; reconnect to this page to confirm the result.
   </p>
 </div>

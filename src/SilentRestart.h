@@ -5,7 +5,8 @@
 
 // ESP.restart() with an RTC_NOINIT flag that survives the reboot, so setup()
 // skips the boot splash and routes straight to a destination. Used to clear
-// heap fragmentation accumulated during a wifi session.
+// heap fragmentation accumulated during a wifi session. The live frontlight
+// state is carried in the RTC token so maintenance restarts remain invisible.
 
 enum class NetworkBootTarget : uint32_t {
   OTA = 2,
@@ -39,6 +40,7 @@ static_assert(isNetworkBootTargetValue(static_cast<uint32_t>(NetworkBootTarget::
 
 void silentRestart();                                            // home screen
 void silentRestartToReader(bool cleanImageBaseOnEntry = false);  // currently-open EPUB (APP_STATE.openEpubPath)
+void silentRestartToSettings();                                  // settings screen
 void silentRestartToNetwork(NetworkBootTarget target, uint32_t payload = 0);
 void silentRestartToManageFonts();
 

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <esp_partition.h>
+
 #include <cstddef>
 #include <cstdint>
 
@@ -9,8 +11,8 @@
 // esp_partition_write + ota_boot::switchTo (no Arduino Update class, no
 // esp_image_verify — those reject our patched image on X4 silicon).
 //
-// Both the SD update activity and the OTA path land here. OTA first
-// downloads the firmware to an SD-card cache file, then calls this.
+// SD and browser updates land here. The on-device OTA menu uses the SDK
+// streaming updater with sector-bounded writes in OtaSectorWriter.h.
 
 namespace firmware_flash {
 
@@ -41,16 +43,17 @@ enum class Result {
 using ProgressCb = void (*)(size_t written, size_t total, void* ctx);
 
 // Open `sdPath`, validate it looks like an ESP32 image, then stream it into the
-// next OTA app partition with interleaved 64 KiB erase + sector writes. On
+// next OTA app partition with interleaved 4 KiB erase + sector writes. On
 // success switches otadata via ota_boot::switchTo. Caller is responsible for
 // ESP.restart() afterwards.
 //
-// `alreadyValidated` lets callers that have just run `validateImageFile()`
-// themselves (e.g. SdFirmwareUpdateActivity, which validates before showing
-// the user the confirmation prompt) skip the redundant second pass. Defaults
-// to false so callers without prior validation (any future entry point) keep
-// the defense-in-depth check.
-Result flashFromSdPath(const char* sdPath, ProgressCb onProgress, void* ctx, bool alreadyValidated = false);
+// A caller may skip the integrity pass only by providing both alreadyValidated
+// and the 32-byte full-file digest returned by validation. The digest is checked
+// against actual flash before boot selection. A boolean alone never bypasses
+// validation after reopening SD. Manual SD updates do not require an INKademic
+// identity or signature, so compatible firmware from other projects stays usable.
+Result flashFromSdPath(const char* sdPath, ProgressCb onProgress, void* ctx, bool alreadyValidated = false,
+                       const uint8_t* authenticatedDigest = nullptr);
 
 // Full-image integrity check that mirrors the bootloader's verification:
 // header magic, segment table walk, XOR checksum, and SHA256 trailer (when
@@ -59,9 +62,13 @@ Result flashFromSdPath(const char* sdPath, ProgressCb onProgress, void* ctx, boo
 //
 // `partitionSize` is the size of the destination OTA partition; pass 0 to
 // skip the size-fits-partition check (e.g. when validating ahead of partition
-// lookup). Streams the file in CHUNK-sized reads; the file is rewound on
-// success so the caller can immediately reread it for flashing.
-Result validateImageFile(const char* sdPath, size_t partitionSize);
+// lookup). Streams the file in CHUNK-sized reads and closes it on return.
+// If supplied, fullDigest receives SHA-256 of the entire file, including trailer.
+Result validateImageFile(const char* sdPath, size_t partitionSize, uint8_t* fullDigest = nullptr);
+
+// Manual files may come from other projects. SignedRelease is the default and
+// must remain in effect for the official catalog and unattended update checks.
+enum class ValidationPolicy { SignedRelease, Manual };
 
 // Validate an image for the browser updater. In addition to the ESP image
 // checks above, this requires the identity marker embedded by the build,
@@ -70,7 +77,12 @@ Result validateImageFile(const char* sdPath, size_t partitionSize);
 // exactly 64 bytes).
 Result validateBrowserImageFile(const char* sdPath, size_t partitionSize, const char* expectedDevice,
                                 const char* currentVersion, const char* signaturePath, char* imageDevice,
-                                size_t imageDeviceCapacity, char* imageVersion, size_t imageVersionCapacity);
+                                size_t imageDeviceCapacity, char* imageVersion, size_t imageVersionCapacity,
+                                uint8_t* authenticatedDigest = nullptr,
+                                ValidationPolicy policy = ValidationPolicy::SignedRelease);
+
+// Verify actual flash contents before changing the boot partition.
+bool verifyPartitionDigest(const esp_partition_t* partition, size_t size, const uint8_t expected[32]);
 
 const char* resultName(Result r);
 

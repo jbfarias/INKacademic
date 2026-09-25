@@ -58,7 +58,8 @@ void OtaUpdateActivity::onWifiSelectionComplete(const bool success) {
     return;
   }
 
-  const auto res = updater.checkForUpdate();
+  const auto sourceResult = updater.loadSavedSource();
+  const auto res = sourceResult == OtaUpdater::OK ? updater.checkForUpdate() : sourceResult;
   if (res != OtaUpdater::OK) {
     LOG_DBG("OTA", "Update check failed: %d", res);
     {
@@ -151,11 +152,23 @@ void OtaUpdateActivity::render(RenderLock&&) {
   if (state == CHECKING_FOR_UPDATE) {
     renderer.drawCenteredText(UI_10_FONT_ID, top, tr(STR_CHECKING_UPDATE));
   } else if (state == WAITING_CONFIRMATION) {
-    renderer.drawCenteredText(UI_10_FONT_ID, top, tr(STR_NEW_UPDATE), true, EpdFontFamily::BOLD);
+    renderer.drawCenteredText(UI_10_FONT_ID, top,
+                              updater.isManualSource() ? tr(STR_MANUAL_FIRMWARE) : tr(STR_NEW_UPDATE), true,
+                              EpdFontFamily::BOLD);
     renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, top + height + metrics.verticalSpacing,
                       (std::string(tr(STR_CURRENT_VERSION)) + INKADEMIC_VERSION).c_str());
-    renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, top + height * 2 + metrics.verticalSpacing * 2,
-                      (std::string(tr(STR_NEW_VERSION)) + updater.getLatestVersion()).c_str());
+    if (updater.isManualSource()) {
+      renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, top + height * 2 + metrics.verticalSpacing * 2,
+                        tr(STR_MANUAL_FIRMWARE_SOURCE));
+      renderer.drawText(
+          UI_10_FONT_ID, metrics.contentSidePadding, top + height * 3 + metrics.verticalSpacing * 3,
+          renderer
+              .truncatedText(UI_10_FONT_ID, updater.getLatestUrl().c_str(), pageWidth - 2 * metrics.contentSidePadding)
+              .c_str());
+    } else {
+      renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, top + height * 2 + metrics.verticalSpacing * 2,
+                        (std::string(tr(STR_NEW_VERSION)) + updater.getLatestVersion()).c_str());
+    }
 
     if (mappedInput.hasTouch()) {
       const auto actions = getOtaActionLayout(renderer);

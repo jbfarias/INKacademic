@@ -1,15 +1,24 @@
+#include "OtaUpdater.h"
+
+#include "FirmwareRequestPolicy.h"
+
 #ifdef SIMULATOR
 #include "OtaUpdater.h"
 
 bool OtaUpdater::isUpdateNewer() const { return false; }
 const std::string& OtaUpdater::getLatestVersion() const { return latestVersion; }
 OtaUpdater::OtaUpdaterError OtaUpdater::checkForUpdate() { return NO_UPDATE; }
+OtaUpdater::OtaUpdaterError OtaUpdater::loadSavedSource() { return NO_UPDATE; }
+OtaUpdater::OtaUpdaterError OtaUpdater::downloadManualToFile(const char*, ProgressCallback, void*, std::atomic<bool>*) {
+  return NO_UPDATE;
+}
 OtaUpdater::OtaUpdaterError OtaUpdater::downloadLatestToFiles(const char*, const char*, ProgressCallback, void*) {
   return NO_UPDATE;
 }
 OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback, void*, std::atomic<bool>*) { return NO_UPDATE; }
 #else
 #include <Arduino.h>
+#include <HalStorage.h>
 #include <Logging.h>
 #include <ReleaseJsonParser.h>
 #include <strings.h>
@@ -20,19 +29,19 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback, void*, s
 
 #include "AppVersion.h"
 #include "FirmwareFlasher.h"
-#include "OtaUpdatePublicKey.h"
+#include "FirmwareIdentity.h"
+#include "FirmwareIdentityScanner.h"
+#include "FirmwareVersion.h"
+#include "OtaSectorWriter.h"
+#include "OtaSignature.h"
 #include "OtaUpdater.h"
+#include "WiFi.h"
 #include "esp_http_client.h"
 #include "esp_ota_ops.h"
 #include "esp_task_wdt.h"
 #include "mbedtls/sha256.h"
 #include "network/HttpDownloader.h"
 #include "network/WifiPowerSaveGuard.h"
-#include "WiFi.h"
-
-#if defined(HAVE_ED25519) && defined(HAVE_ED25519_VERIFY) && defined(HAVE_ED25519_KEY_IMPORT)
-#include <wolfssl/wolfcrypt/ed25519.h>
-#endif
 
 namespace {
 #ifndef INKADEMIC_OTA_RELEASE_URL
@@ -50,110 +59,8 @@ constexpr char firmwareAssetName[] = "firmware.bin";
 #endif
 
 constexpr char binSuffix[] = ".bin";
-constexpr size_t VERSION_SEGMENT_COUNT = 4;
 constexpr size_t OTA_PROGRESS_UPDATE_BYTES = 64 * 1024;
 constexpr size_t OTA_SIGNATURE_SIZE = 64;
-
-struct ParsedVersion {
-  int segments[VERSION_SEGMENT_COUNT] = {0, 0, 0, 0};
-  bool valid = false;
-  int qualifier = 0;
-  int releaseCandidateNumber = 0;
-};
-
-bool isDigit(const char c) { return c >= '0' && c <= '9'; }
-
-bool startsWithNumberAfterOptionalV(const char* version) {
-  if (version == nullptr) return false;
-  if ((version[0] == 'v' || version[0] == 'V') && isDigit(version[1])) return true;
-  return isDigit(version[0]);
-}
-
-bool containsRcMarker(const char* version) {
-  if (version == nullptr) return false;
-  for (const char* p = version; p[0] != '\0' && p[1] != '\0' && p[2] != '\0'; ++p) {
-    if (p[0] == '-' && (p[1] == 'r' || p[1] == 'R') && (p[2] == 'c' || p[2] == 'C')) {
-      return true;
-    }
-  }
-  return false;
-}
-
-bool containsToken(const char* version, const char* token) {
-  return version != nullptr && token != nullptr && strstr(version, token) != nullptr;
-}
-
-int parseReleaseCandidateNumber(const char* version) {
-  if (version == nullptr) return 0;
-  for (const char* p = version; p[0] != '\0' && p[1] != '\0' && p[2] != '\0'; ++p) {
-    if (p[0] != '-' || (p[1] != 'r' && p[1] != 'R') || (p[2] != 'c' && p[2] != 'C')) continue;
-    p += 3;
-    // Accept both common spellings: 1.8.0-rc.2 and 1.8.0-rc-2.
-    if (*p == '.' || *p == '-') ++p;
-    int value = 0;
-    bool foundDigit = false;
-    while (isDigit(*p)) {
-      foundDigit = true;
-      value = value * 10 + (*p - '0');
-      ++p;
-    }
-    return foundDigit ? value : 0;
-  }
-  return 0;
-}
-
-ParsedVersion parseVersion(const char* version) {
-  ParsedVersion parsed;
-  if (!startsWithNumberAfterOptionalV(version)) return parsed;
-
-  const char* p = version;
-  if (p[0] == 'v' || p[0] == 'V') ++p;
-
-  size_t segmentIndex = 0;
-  while (segmentIndex < VERSION_SEGMENT_COUNT) {
-    if (!isDigit(*p)) return parsed;
-
-    int value = 0;
-    while (isDigit(*p)) {
-      value = value * 10 + (*p - '0');
-      ++p;
-    }
-    parsed.segments[segmentIndex] = value;
-    ++segmentIndex;
-
-    if (*p != '.') break;
-    ++p;
-  }
-
-  parsed.valid = true;
-  const bool releaseCandidate = containsRcMarker(version);
-  const bool development = containsToken(version, "-dev") || containsToken(version, "-debug") ||
-                           containsToken(version, "+dev");
-  const bool deviceBuild = containsToken(version, "-x3-x4") || containsToken(version, "-x4-pro") ||
-                           containsToken(version, "-sticky") || containsToken(version, "-recovery-x4-pro");
-  const bool unknownPrerelease = strchr(version, '-') != nullptr && !releaseCandidate && !deviceBuild && !development;
-  parsed.qualifier = releaseCandidate ? 1 : ((development || unknownPrerelease) ? 0 : 2);
-  parsed.releaseCandidateNumber = parseReleaseCandidateNumber(version);
-  return parsed;
-}
-
-int compareVersions(const char* latestVersion, const char* currentVersion) {
-  const ParsedVersion latest = parseVersion(latestVersion);
-  const ParsedVersion current = parseVersion(currentVersion);
-  if (!latest.valid || !current.valid) return 0;
-
-  for (size_t i = 0; i < VERSION_SEGMENT_COUNT; ++i) {
-    if (latest.segments[i] != current.segments[i]) {
-      return latest.segments[i] > current.segments[i] ? 1 : -1;
-    }
-  }
-
-  if (latest.qualifier != current.qualifier) return latest.qualifier > current.qualifier ? 1 : -1;
-  if (latest.qualifier == 1 && latest.releaseCandidateNumber != current.releaseCandidateNumber) {
-    return latest.releaseCandidateNumber > current.releaseCandidateNumber ? 1 : -1;
-  }
-  return 0;
-}
 
 bool isGitHubReleaseEndpoint(const char* url) {
   return url != nullptr && strncmp(url, "https://api.github.com/", sizeof("https://api.github.com/") - 1) == 0;
@@ -251,24 +158,6 @@ bool isMatchingSignatureAssetName(const char* assetName) {
   return endsWith(assetName, ".bin.sig");
 }
 
-#if defined(HAVE_ED25519) && defined(HAVE_ED25519_VERIFY) && defined(HAVE_ED25519_KEY_IMPORT)
-bool verifyEd25519Digest(const uint8_t digest[32], const uint8_t* signature, const size_t signatureLength) {
-  if (signature == nullptr || signatureLength != ED25519_SIG_SIZE) return false;
-
-  ed25519_key key;
-  if (wc_ed25519_init(&key) != 0) return false;
-  const int importResult = wc_ed25519_import_public(inkademic_ota::kEd25519PublicKey,
-                                                    sizeof(inkademic_ota::kEd25519PublicKey), &key);
-  int verified = 0;
-  const int verifyResult = importResult == 0
-                               ? wc_ed25519_verify_msg(signature, static_cast<word32>(signatureLength), digest, 32,
-                                                       &verified, &key)
-                               : -1;
-  wc_ed25519_free(&key);
-  return verifyResult == 0 && verified == 1;
-}
-#endif
-
 /*
  * When esp_crt_bundle.h included, it is pointing wrong header file
  * which is something under WifiClientSecure because of our framework based on arduno platform.
@@ -320,6 +209,7 @@ void notifyOtaProgress(OtaInstallContext* ctx, const bool force) {
 }  // namespace
 
 OtaUpdater::OtaUpdaterError OtaUpdater::checkForUpdate() {
+  if (manualSource) return firmware_request::validManualUrl(otaUrl) ? OK : JSON_PARSE_ERROR;
   WifiPowerSaveGuard wifiPowerSaveGuard;
 
   updateAvailable = false;
@@ -419,11 +309,12 @@ OtaUpdater::OtaUpdaterError OtaUpdater::checkForUpdate() {
 }
 
 bool OtaUpdater::isUpdateNewer() const {
+  if (manualSource) return updateAvailable;
   if (!updateAvailable || latestVersion.empty() || latestVersion == INKADEMIC_VERSION) {
     return false;
   }
 
-  const int comparison = compareVersions(latestVersion.c_str(), INKADEMIC_VERSION);
+  const int comparison = firmware_version::compareForUpdate(latestVersion.c_str(), INKADEMIC_VERSION);
   LOG_DBG("OTA", "Version comparison latest=%s current=%s result=%d", latestVersion.c_str(), INKADEMIC_VERSION,
           comparison);
   return comparison > 0;
@@ -432,7 +323,7 @@ bool OtaUpdater::isUpdateNewer() const {
 const std::string& OtaUpdater::getLatestVersion() const { return latestVersion; }
 
 OtaUpdater::OtaUpdaterError OtaUpdater::downloadLatestToFiles(const char* imagePath, const char* signaturePath,
-                                                               ProgressCallback onProgress, void* ctx) {
+                                                              ProgressCallback onProgress, void* ctx) {
   if (!isUpdateNewer() || imagePath == nullptr || signaturePath == nullptr) return UPDATE_OLDER_ERROR;
   if (otaUrl.empty() || otaSignatureUrl.empty() || otaSize == 0) return SIGNATURE_MISSING_ERROR;
 
@@ -474,6 +365,8 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
   if (isCancellationRequested()) {
     return CANCELLED_ERROR;
   }
+  if (manualSource) return installManualUpdate(onProgress, ctx, cancelRequested);
+
 #if defined(INKADEMIC_REQUIRE_SIGNED_OTA) && INKADEMIC_REQUIRE_SIGNED_OTA
   if (otaSignatureUrl.empty()) {
     LOG_ERR("OTA", "Refusing unsigned firmware on this device");
@@ -524,6 +417,7 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
   uint8_t imageHeader[14] = {};
   size_t imageHeaderLength = 0;
   bool wrongChip = false;
+  firmware_identity::Scanner identity;
 
   HttpDownloader::DownloadOptions downloadOptions;
   downloadOptions.shouldCancel = isCancellationRequested;
@@ -542,7 +436,7 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
             LOG_INF("OTA", "Writing firmware to %s @0x%x size=%zu heap=%u maxAlloc=%u", updatePartition->label,
                     static_cast<unsigned>(updatePartition->address), firmwareSize, ESP.getFreeHeap(),
                     ESP.getMaxAllocHeap());
-            otaBeginError = esp_ota_begin(updatePartition, firmwareSize, &otaHandle);
+            otaBeginError = ota_sector::begin(updatePartition, &otaHandle);
             if (otaBeginError != ESP_OK) {
               LOG_ERR("OTA", "esp_ota_begin failed: %s (heap=%u maxAlloc=%u)", esp_err_to_name(otaBeginError),
                       ESP.getFreeHeap(), ESP.getMaxAllocHeap());
@@ -551,14 +445,14 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
             otaStarted = true;
           }
 
-          otaWriteError = esp_ota_write(otaHandle, chunk, chunkLength);
+          otaWriteError = ota_sector::write(otaHandle, chunk, chunkLength, processedSize);
           if (otaWriteError != ESP_OK) {
             LOG_ERR("OTA", "esp_ota_write failed after %zu bytes: %s", processedSize, esp_err_to_name(otaWriteError));
             return false;
           }
 
           mbedtls_sha256_update(&shaCtx, chunk, chunkLength);
-          processedSize += chunkLength;
+          for (size_t i = 0; i < chunkLength; ++i) identity.feed(static_cast<char>(chunk[i]));
           notifyOtaProgress(&installCtx, false);
           return true;
         };
@@ -657,7 +551,7 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
 #endif
     }
 #if defined(HAVE_ED25519) && defined(HAVE_ED25519_VERIFY) && defined(HAVE_ED25519_KEY_IMPORT)
-    if (!verifyEd25519Digest(computedSha256, otaSignature, otaSignatureBytes)) {
+    if (!ota_signature::verify(computedSha256, otaSignature, otaSignatureBytes)) {
       LOG_ERR("OTA", "Ed25519 signature verification failed");
       esp_ota_abort(otaHandle);
       return SIGNATURE_INVALID_ERROR;
@@ -670,10 +564,24 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
 #endif
   }
 
+  if (!identity.found() || std::strcmp(identity.device(), firmware_identity::deviceType()) != 0) {
+    esp_ota_abort(otaHandle);
+    return WRONG_DEVICE_ERROR;
+  }
+  if (firmware_version::compareForUpdate(identity.version(), INKADEMIC_VERSION) <= 0) {
+    esp_ota_abort(otaHandle);
+    return UPDATE_OLDER_ERROR;
+  }
   esp_err_t esp_err = esp_ota_end(otaHandle);
   if (esp_err != ESP_OK) {
     LOG_ERR("OTA", "esp_ota_end failed: %s", esp_err_to_name(esp_err));
     return INTERNAL_UPDATE_ERROR;
+  }
+
+  // esp_ota_end flushes any buffered bytes before the readback. It does not
+  // select the next boot partition; reject mismatches before that final step.
+  if (!firmware_flash::verifyPartitionDigest(updatePartition, processedSize, computedSha256)) {
+    return HASH_MISMATCH_ERROR;
   }
 
   esp_err = esp_ota_set_boot_partition(updatePartition);

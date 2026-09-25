@@ -2,7 +2,7 @@
 
 O **INKademic** é um fork acadêmico independente do CrossInk, voltado a leitores acadêmicos. O projeto preserva a base do firmware original e incorpora melhorias destinadas à leitura, organização, consulta e estudo de textos acadêmicos em dispositivos de tinta eletrônica.
 
-**Versão atual: v1.7.2 (5 de setembro de 2026).**
+**Versão atual: v1.6.0 (25 de setembro de 2026).**
 
 Este é um projeto independente e não oficial. Os créditos pelo firmware original pertencem aos desenvolvedores e colaboradores do CrossInk.
 
@@ -66,7 +66,7 @@ My goal with this fork was to maintain the core Crosspoint firmware while integr
 - Academic notes and highlights with document-safe migrations, compatible with the fork's ClippingStore v4.
 - User-defined annotation tags for clippings and current pages, with tag-aware exports.
 - Web **Highlights** page for searching, editing, tagging, and exporting EPUB notes through `/highlights`.
-- The academic notes, highlights, clippings, bookmarks, and annotation tags are included in every v1.7.2 device build.
+- The academic notes, highlights, clippings, bookmarks, and annotation tags are included in every v1.6.0 device build.
 - Firmware can be staged, validated, and installed from the **Firmware** page in the existing browser file-transfer interface.
 - X4 Pro support includes its ESP32-S3 display profile, touch/Home key, frontlight controls, USB storage, and INKademic USB identity.
 - EPUB robustness improvements for ruby groups, trailing markup after `</html>`, and transparent sleep overlays.
@@ -137,14 +137,13 @@ The fastest way to install INKademic is by using Inky, INKademic's web companion
 
 Download a `firmware-*.bin` from the [INKademic releases page](https://github.com/jbfarias/INKademic/releases), then flash it with the web installer or command line.
 
-For **v1.7.2**, choose the firmware for your device:
+For **v1.6.0**, choose the firmware for your device:
 
-- [X3/X4 firmware](https://github.com/jbfarias/INKademic/releases/download/v1.7.2/firmware-x3-x4-v1.7.2.bin)
-- [X4 Pro firmware](https://github.com/jbfarias/INKademic/releases/download/v1.7.2/firmware-x4-pro-v1.7.2.bin)
-- [Sticky firmware](https://github.com/jbfarias/INKademic/releases/download/v1.7.2/firmware-sticky-v1.7.2.bin)
-- [X4 Pro recovery loader](https://github.com/jbfarias/INKademic/releases/download/v1.7.2/firmware-recovery-x4-pro-v1.7.2.bin)
+- [X3/X4 firmware](https://github.com/jbfarias/INKademic/releases/download/v1.6.0/firmware-x3-x4-v1.6.0.bin)
+- [X4 Pro firmware](https://github.com/jbfarias/INKademic/releases/download/v1.6.0/firmware-x4-pro-v1.6.0.bin)
+- [Sticky / X4 Lite firmware](https://github.com/jbfarias/INKademic/releases/download/v1.6.0/firmware-sticky-v1.6.0.bin)
 
-The three device builds include the academic annotation features. The recovery loader is only for the documented X4 Pro factory-compatible recovery path. Verify the SHA-256 values and follow the device-specific instructions in the [v1.7.2 release notes](./docs/release-notes-1.7.2.md) before flashing.
+The three device builds include the academic annotation features. Verify the SHA-256 values and follow the device-specific instructions in the [v1.6.0 release notes](./docs/release-notes-1.6.0.md) before flashing.
 
 See [Installation](./docs/installation.md) for step-by-step flashing and revert instructions.
 

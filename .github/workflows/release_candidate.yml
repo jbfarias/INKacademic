@@ -74,7 +74,7 @@ jobs:
       - name: Build INKademic
         shell: bash
         env:
-          INKADEMIC_RELEASE_VERSION: "1"
+          INKADEMIC_RC_ARTIFACTS: "1"
           INKADEMIC_RC_BRANCH: ${{ env.RC_BRANCH_RAW }}
           INKADEMIC_RC_HASH: ${{ env.RC_HASH_SHORT }}
         run: pio run -j1 -e ${{ matrix.environment }}

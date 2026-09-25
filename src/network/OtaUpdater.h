@@ -5,6 +5,7 @@
 
 class OtaUpdater {
   bool updateAvailable = false;
+  bool manualSource = false;
   std::string latestVersion;
   std::string otaUrl;
   std::string otaSha256;
@@ -43,7 +44,15 @@ class OtaUpdater {
   const std::string& getLatestSignatureUrl() const { return otaSignatureUrl; }
   size_t getLatestSignatureSize() const { return otaSignatureSize; }
 
+  static constexpr const char* MANUAL_SOURCE_PATH = "/.inkademic-ota-source";
   OtaUpdater() = default;
+  bool isManualSource() const { return manualSource; }
+  bool setManualSource(const std::string& url);
+  // Only the on-device menu opts into the user's saved manual source. The
+  // official browser catalog constructs a default updater and remains signed.
+  OtaUpdaterError loadSavedSource();
+  OtaUpdaterError downloadManualToFile(const char* path, ProgressCallback onProgress = nullptr, void* ctx = nullptr,
+                                       std::atomic<bool>* cancelRequested = nullptr);
   bool isUpdateNewer() const;
   const std::string& getLatestVersion() const;
   OtaUpdaterError checkForUpdate();
@@ -54,4 +63,6 @@ class OtaUpdater {
                                         ProgressCallback onProgress = nullptr, void* ctx = nullptr);
   OtaUpdaterError installUpdate(ProgressCallback onProgress = nullptr, void* ctx = nullptr,
                                 std::atomic<bool>* cancelRequested = nullptr);
+  // Explicit manual source only; never used by the official catalog.
+  OtaUpdaterError installManualUpdate(ProgressCallback onProgress, void* ctx, std::atomic<bool>* cancelRequested);
 };

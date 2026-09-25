@@ -61,8 +61,8 @@ enum : int {
 inline esp_reset_reason_t esp_reset_reason() { return ESP_RST_UNKNOWN; }
 inline esp_sleep_wakeup_cause_t esp_sleep_get_wakeup_cause() { return ESP_SLEEP_WAKEUP_UNDEFINED; }
 #else
-#include <esp_sleep.h>
 #include <esp_ota_ops.h>
+#include <esp_sleep.h>
 #include <esp_system.h>
 #endif
 
@@ -352,7 +352,10 @@ RTC_NOINIT_ATTR uint32_t silentReaderPageBuildFlags;
 constexpr uint32_t SILENT_REBOOT_MAGIC = 0xC1EAB007;
 constexpr uint32_t SILENT_REBOOT_TARGET_HOME = 0;
 constexpr uint32_t SILENT_REBOOT_TARGET_READER = 1;
+constexpr uint32_t SILENT_REBOOT_TARGET_SETTINGS = 8;
 constexpr uint32_t SILENT_REBOOT_READER_CLEAN_IMAGE_BASE = 1U << 0;
+constexpr uint32_t SILENT_REBOOT_LIGHT_ON = 1U << 31;
+constexpr uint32_t SILENT_REBOOT_ROUTE_PAYLOAD_MASK = ~SILENT_REBOOT_LIGHT_ON;
 constexpr uint32_t SILENT_READER_PAGE_BUILD_MAGIC = 0xC1EAB017;
 constexpr uint32_t SILENT_READER_PAGE_BUILD_AUTO_TURN = 1U << 0;
 constexpr uint32_t NETWORK_RENDER_TASK_STACK_BYTES = 8192;
@@ -394,12 +397,17 @@ static void clearSilentRestartReaderPageBuild() {
   silentReaderPageBuildFlags = 0;
 }
 
+static void armSilentRestart(const uint32_t target, const uint32_t routePayload = 0) {
+  silentRebootTarget = target;
+  silentRebootPayload = routePayload & SILENT_REBOOT_ROUTE_PAYLOAD_MASK;
+  if (Frontlight.isOn()) silentRebootPayload |= SILENT_REBOOT_LIGHT_ON;
+  silentRebootMagic = SILENT_REBOOT_MAGIC;
+}
+
 void silentRestart() {
   if (deepSleepInProgress) return;  // sleeping supersedes the heap-defrag reboot
   clearSilentRestartReaderPageBuild();
-  silentRebootTarget = SILENT_REBOOT_TARGET_HOME;
-  silentRebootPayload = 0;
-  silentRebootMagic = SILENT_REBOOT_MAGIC;
+  armSilentRestart(SILENT_REBOOT_TARGET_HOME);
   LOG_DBG("MAIN", "Silent restart (target=home)");
   // E-ink retains the previous frame until Home's first paint lands (~2-3s).
   // Without an overlay, users don't see the reboot and fire input through to
@@ -438,10 +446,18 @@ bool consumeSilentRestartReaderPageBuild(const std::string& bookPath, uint16_t& 
 
 void silentRestartToReader(const bool cleanImageBaseOnEntry) {
   if (deepSleepInProgress) return;  // sleeping supersedes the heap-defrag reboot
-  silentRebootTarget = SILENT_REBOOT_TARGET_READER;
-  silentRebootPayload = cleanImageBaseOnEntry ? SILENT_REBOOT_READER_CLEAN_IMAGE_BASE : 0;
-  silentRebootMagic = SILENT_REBOOT_MAGIC;
+  armSilentRestart(SILENT_REBOOT_TARGET_READER, cleanImageBaseOnEntry ? SILENT_REBOOT_READER_CLEAN_IMAGE_BASE : 0);
   LOG_DBG("MAIN", "Silent restart (target=reader cleanImageBase=%d)", cleanImageBaseOnEntry ? 1 : 0);
+  GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
+  delay(50);
+  restartWithSilentToken();
+}
+
+void silentRestartToSettings() {
+  if (deepSleepInProgress) return;
+  clearSilentRestartReaderPageBuild();
+  armSilentRestart(SILENT_REBOOT_TARGET_SETTINGS);
+  LOG_DBG("MAIN", "Silent restart (target=settings)");
   GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
   delay(50);
   restartWithSilentToken();
@@ -450,9 +466,7 @@ void silentRestartToReader(const bool cleanImageBaseOnEntry) {
 void silentRestartToNetwork(const NetworkBootTarget target, const uint32_t payload) {
   if (deepSleepInProgress) return;
   clearSilentRestartReaderPageBuild();
-  silentRebootTarget = static_cast<uint32_t>(target);
-  silentRebootPayload = payload;
-  silentRebootMagic = SILENT_REBOOT_MAGIC;
+  armSilentRestart(static_cast<uint32_t>(target), payload);
   LOG_DBG("MAIN", "Silent restart (target=network/%lu payload=%lu)", static_cast<unsigned long>(silentRebootTarget),
           static_cast<unsigned long>(payload));
   GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
@@ -975,13 +989,13 @@ void persistFrontlightStateBeforeSleep() {
   // Quick Lock intentionally blanks the live PWM output without changing the
   // user's preferred state. Preserve that pre-lock intent if sleep is entered
   // while the lock is active; otherwise use the live HAL values.
-  const bool desiredOn = buttonShortcutController.isQuickLocked() ? APP_STATE.quickLockRestoreFrontlight
-                                                                   : Frontlight.isOn();
+  const bool desiredOn =
+      buttonShortcutController.isQuickLocked() ? APP_STATE.quickLockRestoreFrontlight : Frontlight.isOn();
   const uint8_t brightness = Frontlight.brightness();
   const uint8_t warmth = Frontlight.warmth();
   const uint8_t on = desiredOn ? 1 : 0;
-  const bool changed = SETTINGS.frontlightBrightness != brightness || SETTINGS.frontlightWarmth != warmth ||
-                       SETTINGS.frontlightOn != on;
+  const bool changed =
+      SETTINGS.frontlightBrightness != brightness || SETTINGS.frontlightWarmth != warmth || SETTINGS.frontlightOn != on;
   SETTINGS.frontlightBrightness = brightness;
   SETTINGS.frontlightWarmth = warmth;
   SETTINGS.frontlightOn = on;
@@ -1148,13 +1162,16 @@ void setup() {
   // Read-and-clear so a panic later in setup() doesn't loop into silent reboot.
   // Validate the target too — RTC_NOINIT memory is uninitialized on cold boot.
   const bool isSilentReboot = (silentRebootMagic == SILENT_REBOOT_MAGIC);
-  const bool isValidSilentTarget =
-      silentRebootTarget <= SILENT_REBOOT_TARGET_READER || isNetworkBootTargetValue(silentRebootTarget);
+  const bool isValidSilentTarget = silentRebootTarget <= SILENT_REBOOT_TARGET_READER ||
+                                   silentRebootTarget == SILENT_REBOOT_TARGET_SETTINGS ||
+                                   isNetworkBootTargetValue(silentRebootTarget);
   const uint32_t snapshotTarget = (isSilentReboot && isValidSilentTarget) ? silentRebootTarget : 0;
   const uint32_t snapshotPayload = isSilentReboot ? silentRebootPayload : 0;
+  const uint32_t routePayload = snapshotPayload & SILENT_REBOOT_ROUTE_PAYLOAD_MASK;
+  const bool silentRebootLightOn = (snapshotPayload & SILENT_REBOOT_LIGHT_ON) != 0;
   const bool cleanImageBaseOnEntry =
-      snapshotTarget == SILENT_REBOOT_TARGET_READER && (snapshotPayload & SILENT_REBOOT_READER_CLEAN_IMAGE_BASE) != 0;
-  const bool isNetworkResume = snapshotTarget >= static_cast<uint32_t>(NetworkBootTarget::OTA);
+      snapshotTarget == SILENT_REBOOT_TARGET_READER && (routePayload & SILENT_REBOOT_READER_CLEAN_IMAGE_BASE) != 0;
+  const bool isNetworkResume = isNetworkBootTargetValue(snapshotTarget);
   // KOReader Sync and OPDS can render their parent screens while a deferred
   // Wi-Fi child is completing. On S3 devices, keep the reader-sized render
   // stack without loading the rest of the reader resources. C3 devices retain
@@ -1249,7 +1266,7 @@ void setup() {
   I18N.setLanguage(static_cast<Language>(SETTINGS.language));
   if (!isNetworkResume) {
     RECENT_BOOKS.loadFromFile();
-  logBootHeap("settings and recent books loaded");
+    logBootHeap("settings and recent books loaded");
     KOREADER_STORE.loadFromFile();
     logBootHeap("sync credentials loaded");
     Dictionary::isValidDictionary();
@@ -1261,10 +1278,11 @@ void setup() {
   UITheme::getInstance().reload();
   ButtonNavigator::setMappedInputManager(mappedInputManager);
   logBootHeap("boot state ready");
-  // Respect Restore on Wake on Pro too. Keep a pending Quick Lock dark until unlock.
-  const bool restoreLightOn = SETTINGS.frontlightOn != 0 &&
-      (SETTINGS.frontlightRestoreOnWake != 0 || (isSilentReboot && !isNetworkResume)) &&
-      !APP_STATE.quickLockResumePending;
+  // A maintenance restart restores the live light state captured immediately
+  // before reboot. Ordinary wakes continue to follow the saved preference.
+  const bool restoreLightOn =
+      !APP_STATE.quickLockResumePending &&
+      (isSilentReboot ? silentRebootLightOn : SETTINGS.frontlightOn != 0 && SETTINGS.frontlightRestoreOnWake != 0);
   LOG_INF("LIGHT", "Wake policy: savedOn=%u restoreOnWake=%u brightness=%u warmth=%u quickLockPending=%u -> on=%u",
           SETTINGS.frontlightOn, SETTINGS.frontlightRestoreOnWake, SETTINGS.frontlightBrightness,
           SETTINGS.frontlightWarmth, APP_STATE.quickLockResumePending ? 1 : 0, restoreLightOn ? 1 : 0);
@@ -1394,14 +1412,14 @@ void setup() {
         break;
       }
       case NetworkBootTarget::OPDS:
-        launched = activityManager.goToOpdsServer(snapshotPayload, true);
+        launched = activityManager.goToOpdsServer(routePayload, true);
         break;
       case NetworkBootTarget::KOREADER_SYNC:
         launched = startGlobalSyncProgress(true);
         break;
       case NetworkBootTarget::KOREADER_AUTH: {
         const auto mode =
-            snapshotPayload == 1 ? KOReaderAuthActivity::Mode::SIGN_UP : KOReaderAuthActivity::Mode::AUTHENTICATE;
+            routePayload == 1 ? KOReaderAuthActivity::Mode::SIGN_UP : KOReaderAuthActivity::Mode::AUTHENTICATE;
         auto authActivity = makeUniqueNoThrow<KOReaderAuthActivity>(renderer, mappedInputManager, mode);
         if (authActivity) {
           activityManager.replaceActivity(std::move(authActivity));
@@ -1413,7 +1431,7 @@ void setup() {
         break;
       }
       case NetworkBootTarget::FILE_TRANSFER:
-        launched = activityManager.resumeFileTransferFromNetworkBoot(snapshotPayload);
+        launched = activityManager.resumeFileTransferFromNetworkBoot(routePayload);
         break;
       case NetworkBootTarget::MANAGE_FONTS: {
         auto fontsActivity = makeUniqueNoThrow<FontDownloadActivity>(renderer, mappedInputManager);
@@ -1434,6 +1452,8 @@ void setup() {
   } else if (resume == BootResume::Silent && snapshotTarget == SILENT_REBOOT_TARGET_READER &&
              !APP_STATE.openEpubPath.empty()) {
     activityManager.goToReader(APP_STATE.openEpubPath, false, false, cleanImageBaseOnEntry);
+  } else if (resume == BootResume::Silent && snapshotTarget == SILENT_REBOOT_TARGET_SETTINGS) {
+    activityManager.goToSettings();
   } else if (resume == BootResume::Silent) {
     // target == home (or reader with no open book): land on home — don't fall
     // through to the sleep-wake "resume reader" logic, which fires on stale
@@ -1644,6 +1664,18 @@ void loop() {
     return;
   }
 
+  // A short Power press configured as Sleep must remain pending long enough
+  // for a possible second X4 Pro click. Otherwise the first release sleeps
+  // immediately and the frontlight double-click can never complete.
+  const bool x4ProFrontlightSleepClickPending = BoardConfig::isX4Pro() &&
+                                                SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::SLEEP &&
+                                                lastX4ProPowerClickAt != 0;
+  if (x4ProFrontlightSleepClickPending && millis() - lastX4ProPowerClickAt > X4PRO_POWER_DOUBLE_CLICK_MS) {
+    lastX4ProPowerClickAt = 0;
+    enterDeepSleep();
+    return;
+  }
+
   const unsigned long sleepTimeoutMs = SETTINGS.getSleepTimeoutMs();
   if (sleepTimeoutMs > 0 && millis() - lastActivityTime >= sleepTimeoutMs) {
     LOG_DBG("SLP", "Auto-sleep triggered after %lu ms of inactivity", sleepTimeoutMs);
@@ -1671,7 +1703,8 @@ void loop() {
         lastActivityTime = millis();
         return;
       }
-    } else if (dispatchShortcutAction(powerAction)) {
+    } else if (!(powerAction == CrossPointSettings::SHORT_PWRBTN::SLEEP && x4ProFrontlightSleepClickPending) &&
+               dispatchShortcutAction(powerAction)) {
       lastActivityTime = millis();
       return;
     }
@@ -1732,7 +1765,16 @@ void loop() {
     if (millis() - lastActivityTime >= HalPowerManager::IDLE_POWER_SAVING_MS) {
       // If we've been inactive for a while, increase the delay to save power
       powerManager.setPowerSaving(true);  // Lower CPU frequency after extended inactivity
-      delay(50);
+      // Keep the same 50 ms idle budget, but wake polling as soon as raw
+      // contact appears. Two successive input samples are needed to confirm a
+      // press, so one uninterrupted 50 ms delay can lose a quick click.
+      const unsigned long idleStart = millis();
+      while (millis() - idleStart < 50) {
+        delay(10);
+#ifndef SIMULATOR
+        if (gpio.rawInputActive()) break;
+#endif
+      }
     } else {
       // Short delay to prevent tight loop while still being responsive
       delay(10);

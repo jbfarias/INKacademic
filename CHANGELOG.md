@@ -1,11 +1,76 @@
-## [Unreleased]
+## [1.6.0] - 2026-09-25
 
-## [1.7.2] - 2026-09-05
+### Versioning
+
+- Establish `1.6.0` as the first official INKademic release after correcting
+  the fork's former `1.6.1`–`1.8.0` numbering into the `1.5.x` line.
+- Treat installed legacy-numbered builds as their corrected predecessors when
+  comparing updates, so they can migrate directly to `1.6.0`.
+
+### Fixed
+
+- Restore the X4 Pro frontlight by using the 10 kHz PWM rate supported by its
+  sleep-retained 10-bit clock; the 25 kHz configuration was rejected by LEDC
+  and left both warm/cool channels dark.
+- Prevent the X4 Pro from resetting when a browser opens the device portal by
+  returning to the watchdog-fed main loop after each HTTP request instead of
+  batching up to 500 potentially blocking requests.
+- Preserve the live frontlight state across silent maintenance restarts and
+  keep the X4 Pro Power-button double-click available when a short press is
+  configured to put the device to sleep.
+- Shut Wi-Fi down after leaving the Settings network picker and return to
+  Settings through a silent restart, releasing network heap and radio power.
+- Poll physical button contacts in short slices during idle power saving so a
+  quick press is not lost inside the former uninterrupted 50 ms delay.
+- Add ETags to portal pages and static assets so repeat browser navigation can
+  use small conditional responses while new firmware immediately serves its
+  updated interface.
+- The on-device OTA menu now erases firmware incrementally and writes within
+  4 KiB sector boundaries, servicing the task watchdog and letting the idle
+  task run between operations. Previously only SD/browser installation used
+  bounded erase windows; the OTA menu still erased the whole image at startup.
+  Hardware installation validation remains required, and older installed
+  firmware does not acquire this fix merely by downloading a corrected image.
+
+- Correct inverted bitmap orientation, including odd image widths and clipping.
+- Parse firmware versions with bounded arithmetic and consistent RC/development
+  ordering. RC builds now use the same identity across X3/X4, Sticky and X4 Pro.
+- Keep rejected multipart requests from altering an existing staged upload;
+  preserve resumable offsets and reject malformed size/session parameters.
+- Clarify that the frontlight default applies when the setting is absent;
+  existing saved off values are preserved.
+
+### Added
+
+- Explicit manual installation of other projects through the browser, without
+  requiring an INKademic signature or version marker. SD interoperability remains.
+- Manual OTA from a direct HTTP(S) firmware URL. The browser can download to the
+  reader or save that URL as the on-device OTA menu source; users can restore the
+  official source. The device identifies manual updates before confirmation.
+
+### Security
+
+- Enable and require Ed25519 verification for official INKademic updates on all
+  hardware application targets, with compile/link gates and signature regression
+  tests. A failed official signature never silently switches to manual mode.
+- Read back written flash and compare its SHA-256 with the validated image before
+  selecting the next boot partition. Bind identity, structure and signature to
+  the same bytes; bind manual staged files to the digest shown as ready.
+- Restrict browser firmware controls to the reader's origin with an explicit
+  request header; command-line clients also need the header. This is request
+  protection, not network authentication.
+
+### Removed
+
+- Stop tracking 21 generated firmware binaries under `.pio/build`; build output
+  remains ignored. Historical release assets are unaffected.
+
+## [1.5.4] - 2026-09-05
 
 ### Changed
 
 - Promoted the watchdog-safe X4 Pro, academic annotation, browser firmware,
-  recovery, and reliability work from the release-candidate line to the 1.7.2
+  recovery, and reliability work from the release-candidate line to the 1.5.4
   release.
 - Made the built-in OTA endpoint use the canonical `jbfarias/INKademic`
   repository name, avoiding dependence on the former `INKacademic` spelling.
@@ -24,7 +89,7 @@
 - Corrected bitmap rendering so the boot/sleep logo and other image assets keep
   the proper orientation on the portrait X4 Pro display.
 
-## [1.7.1-rc.2] - 2026-09-05
+## [1.5.4-rc.4] - 2026-09-05
 
 ### Added
 
@@ -60,9 +125,9 @@
   watchdog before and after every erase/write operation, including the minimal
   recovery loader.
 
-## [1.7.1-rc.1] - 2026-09-05
+## [1.5.4-rc.3] - 2026-09-05
 
-This RC replaces the earlier `1.7.0-rc.2` image after the X4 Pro watchdog and
+This RC replaces the earlier `1.5.4-rc.2` image after the X4 Pro watchdog and
 Unlocker TLS failures found during installation testing.
 
 ### Added
@@ -100,7 +165,7 @@ Unlocker TLS failures found during installation testing.
   and [USB Drive activity](https://github.com/crosspoint-reader/crosspoint-reader/blob/develop/src/activities/network/UsbDriveActivity.cpp),
   keeping INKademic's academic activities and storage formats intact.
 
-## [v1.7.0-rc.2] - 2026-09-05
+## [v1.5.4-rc.2] - 2026-09-05
 
 ### Added
 
@@ -125,7 +190,7 @@ Unlocker TLS failures found during installation testing.
   policy across wake and Quick Lock.
 - Hardened compressed EPUB reads against negative or oversized storage results.
 
-## [v1.7.0-rc] - 2026-08-23
+## [v1.5.4-rc.1] - 2026-08-23
 
 ### Added
 
@@ -143,7 +208,7 @@ Unlocker TLS failures found during installation testing.
 - Kept the BookOrbit integration out of the firmware core for this release
   candidate; it remains a future optional synchronization layer.
 
-## [v1.6.1] - 2026-08-22
+## [v1.5.3] - 2026-08-22
 
 ### Changed
 

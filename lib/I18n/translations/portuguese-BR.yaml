@@ -703,3 +703,6 @@ STR_SHORT_PRESS_POWER: "Toque curto no botão liga/desliga"
 STR_LONG_PRESS_POWER: "Toque longo no botão liga/desliga"
 STR_LONG_PRESS_BACK: "Toque longo em Voltar"
 STR_LONG_PRESS_MENU_SHORTCUT: "Toque longo no menu"
+
+STR_MANUAL_FIRMWARE: "Instalação manual de firmware"
+STR_MANUAL_FIRMWARE_SOURCE: "Assinatura não verificada pelo INKademic"

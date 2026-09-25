@@ -105,6 +105,13 @@ jobs:
           set -euo pipefail
           pio run -j1 -e ${{ matrix.environment }} | tee pio-${{ matrix.environment }}.log
 
+      - name: Test firmware security and SD interoperability
+        if: matrix.environment == 'x4-pro'
+        run: |
+          cmake -S test/firmware_security -B /tmp/firmware-security
+          cmake --build /tmp/firmware-security -j2
+          ctest --test-dir /tmp/firmware-security --output-on-failure
+
       - name: Extract firmware stats
         run: |
           set -euo pipefail

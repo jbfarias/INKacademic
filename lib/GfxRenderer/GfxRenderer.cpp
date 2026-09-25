@@ -1827,37 +1827,13 @@ void GfxRenderer::drawImage(const uint8_t bitmap[], const int x, const int y, co
 
 void GfxRenderer::drawImageInverted(const uint8_t bitmap[], const int x, const int y, const int width,
                                     const int height) const {
-  int rotatedX = 0;
-  int rotatedY = 0;
-  rotateCoordinates(orientation, x, y, &rotatedX, &rotatedY, panelWidth, panelHeight);
-  switch (orientation) {
-    case Portrait:
-      rotatedY = rotatedY - height;
-      break;
-    case PortraitInverted:
-      rotatedX = rotatedX - width;
-      break;
-    case LandscapeClockwise:
-      rotatedY = rotatedY - height;
-      rotatedX = rotatedX - width;
-      break;
-    case LandscapeCounterClockwise:
-      break;
-  }
-
-  const int imageWidthBytes = width / 8;
-  if (!frameBuffer || imageWidthBytes <= 0 || rotatedX < 0 || rotatedY < 0) return;
-
-  const int destByteX = rotatedX / 8;
-  for (int row = 0; row < height; row++) {
-    const int destY = rotatedY + row;
-    if (destY >= panelHeight) break;
-
-    const int destOffset = destY * panelWidthBytes + destByteX;
-    const int srcOffset = row * imageWidthBytes;
-    for (int col = 0; col < imageWidthBytes; col++) {
-      if (destByteX + col >= panelWidthBytes) break;
-      frameBuffer[destOffset + col] = static_cast<uint8_t>(~bitmap[srcOffset + col]);
+  if (!bitmap || width <= 0 || height <= 0) return;
+  const int sourceWidthBytes = (width + 7) / 8;
+  for (int sourceY = 0; sourceY < height; ++sourceY) {
+    for (int sourceX = 0; sourceX < width; ++sourceX) {
+      const uint8_t value = bitmap[sourceY * sourceWidthBytes + (sourceX >> 3)];
+      const bool sourceWhite = (value & (0x80 >> (sourceX & 7))) != 0;
+      drawPixel(x + sourceX, y + sourceY, sourceWhite);
     }
   }
 }

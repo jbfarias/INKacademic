@@ -74,6 +74,8 @@ def emit_header(path, ident, data, *, original_len=None):
         else:
             h.write(f"constexpr size_t {ident}CompressedSize = {len(data)};\n")
             h.write(f"constexpr size_t {ident}OriginalSize = {original_len};\n")
+        etag = hashlib.sha1(data).hexdigest()
+        h.write(f'constexpr char {ident}ETag[] = "\\"{etag}\\"";\n')
 
 def read(*parts):
     with open(os.path.join(*parts), encoding="utf-8") as f:

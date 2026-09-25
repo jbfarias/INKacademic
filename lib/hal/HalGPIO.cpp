@@ -195,6 +195,20 @@ bool HalGPIO::wasReleased(uint8_t buttonIndex) const { return inputMgr.wasReleas
 
 bool HalGPIO::wasAnyReleased() const { return inputMgr.wasAnyReleased(); }
 
+bool HalGPIO::rawInputActive() {
+#if CROSSPOINT_EMULATED == 0
+  if (inputMgr.isPowerButtonPhysicallyPressed()) return true;
+  InputManager::ButtonAdcSample group1{}, group2{};
+  inputMgr.readButtonAdc(group1, group2);
+  // Xteink ADC ladders idle near the 12-bit full-scale rail. Every button
+  // band sits safely below this threshold.
+  constexpr int IDLE_RAIL_MIN = 4000;
+  return (group1.raw >= 0 && group1.raw < IDLE_RAIL_MIN) || (group2.raw >= 0 && group2.raw < IDLE_RAIL_MIN);
+#else
+  return false;
+#endif
+}
+
 unsigned long HalGPIO::getHeldTime() const { return inputMgr.getHeldTime(); }
 
 unsigned long HalGPIO::getPowerButtonHeldTime() const { return inputMgr.getPowerButtonHeldTime(); }

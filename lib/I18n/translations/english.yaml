@@ -823,3 +823,6 @@ STR_LONG_PRESS_MENU_SHORTCUT: "Long-Press Menu"
 STR_TAP_HOME_SHORTCUT: "Tap Home"
 STR_LONG_PRESS_HOME_SHORTCUT: "Long-Press Home"
 STR_DOUBLE_TAP_HOME_SHORTCUT: "Double Tap Home"
+
+STR_MANUAL_FIRMWARE: "Manual firmware update"
+STR_MANUAL_FIRMWARE_SOURCE: "Signature not verified by INKademic"

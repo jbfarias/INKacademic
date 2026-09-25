@@ -117,7 +117,9 @@ def get_inkademic_version(project_dir):
 
 def get_release_candidate_version(project_dir):
     short_hash = os.environ.get('INKADEMIC_RC_HASH') or get_git_short_hash(project_dir)
-    return f'{get_inkademic_version(project_dir)}-rc+{sanitize_version_component(short_hash)}'
+    base = get_inkademic_version(project_dir)
+    base = re.sub(r'(?i)-rc(?:[.-]?[0-9]+)?$', '', base)
+    return f'{base}-rc+{sanitize_version_component(short_hash)}'
 
 
 def get_production_version(project_dir):
@@ -151,12 +153,13 @@ def inject_version(env):
         # environments used to define INKADEMIC_VERSION directly in
         # platformio.ini, which made their release binaries report a stale
         # variant version (for example 1.7.0-x4-pro instead of 1.7.0-rc).
-        device_suffix = f'-{pioenv}'
-        if os.environ.get('INKADEMIC_RELEASE_VERSION'):
+        if os.environ.get('INKADEMIC_RC_HASH'):
+            version_string = get_release_candidate_version(project_dir)
+        elif os.environ.get('INKADEMIC_RELEASE_VERSION'):
             version_string = get_production_version(project_dir)
             print(f'INKademic production build version: {version_string}')
         else:
-            version_string = f'{get_inkademic_version(project_dir)}{device_suffix}'
+            version_string = f'{get_inkademic_version(project_dir)}-dev+{pioenv}'
             print(f'INKademic {pioenv} build version: {version_string}')
         env.Append(CPPDEFINES=[('INKADEMIC_VERSION', f'\\"{version_string}\\"')])
 

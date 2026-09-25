@@ -436,7 +436,11 @@ void CrossPointWebServerActivity::loop() {
       }
     }
 
-    // Handle web server requests while keeping input responsive.
+    // Handle one web request per activity pass. The main Arduino loop owns a
+    // 15-second task watchdog and feeds it between ActivityManager::loop()
+    // calls. WebServer::handleClient() may wait several seconds for a slow
+    // browser connection, so batching hundreds of calls here can starve that
+    // watchdog while a page opens and reset the device.
     if (webServer && webServer->isRunning()) {
       const unsigned long timeSinceLastHandleClient = millis() - lastHandleClientTime;
 
@@ -445,25 +449,7 @@ void CrossPointWebServerActivity::loop() {
         LOG_DBG("WEBACT", "WARNING: %lu ms gap since last handleClient", timeSinceLastHandleClient);
       }
 
-      // Process HTTP requests in tight loop for maximum throughput
-      // More iterations = more data processed per main loop cycle
-      constexpr int MAX_ITERATIONS = 500;
-      for (int i = 0; i < MAX_ITERATIONS && webServer->isRunning(); i++) {
-        webServer->handleClient();
-        // Yield and check for exit button every 64 iterations
-        if ((i & 0x3F) == 0x3F) {
-          yield();
-          // Force trigger an update of which buttons are being pressed so be have accurate state
-          // for back button checking
-          mappedInput.update();
-          // This local update can consume one-shot exit events before the
-          // ActivityManager sees them, so honor every exit route here.
-          if (exitRequested()) {
-            exitToOrigin();
-            return;
-          }
-        }
-      }
+      webServer->handleClient();
       lastHandleClientTime = millis();
     }
   }

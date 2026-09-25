@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <HalStorage.h>
 #include <Logging.h>
+#include <Memory.h>
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
 #include <esp_task_wdt.h>
@@ -14,12 +15,10 @@
 #include <memory>
 #include <string>
 
+#include "FirmwareIdentityScanner.h"
+#include "FirmwareVersion.h"
 #include "OtaBootSwitch.h"
-#include "OtaUpdatePublicKey.h"
-
-#if defined(HAVE_ED25519) && defined(HAVE_ED25519_VERIFY) && defined(HAVE_ED25519_KEY_IMPORT)
-#include <wolfssl/wolfcrypt/ed25519.h>
-#endif
+#include "OtaSignature.h"
 
 namespace firmware_flash {
 
@@ -168,7 +167,7 @@ Result feedHashAndChecksum(HalFile& file, size_t length, uint8_t* xorAccum, mbed
 }
 }  // namespace
 
-Result validateImageFile(const char* sdPath, size_t partitionSize) {
+Result validateImageFile(const char* sdPath, size_t partitionSize, uint8_t* fullDigest) {
   HalFile file;
   if (!Storage.openFileForRead("FLASH", sdPath, file) || !file) {
     LOG_ERR("FLASH", "validate: open failed: %s", sdPath);
@@ -210,8 +209,10 @@ Result validateImageFile(const char* sdPath, size_t partitionSize) {
   const uint8_t segCount = header[1];
   const bool hashAppended = header[23] != 0;
 
-  auto buf = std::unique_ptr<uint8_t[]>(new (std::nothrow) uint8_t[CHUNK]);
+  // Reuse 4 KiB off the small task stack for the entire validation pass.
+  auto buf = makeUniqueNoThrow<uint8_t[]>(CHUNK);
   if (!buf) {
+    LOG_ERR("FLASH", "OOM allocating 4 KiB validation buffer");
     file.close();
     return Result::OOM;
   }
@@ -296,7 +297,11 @@ Result validateImageFile(const char* sdPath, size_t partitionSize) {
 
   if (hashAppended) {
     uint8_t computed[SHA_TRAILER];
-    mbedtls_sha256_finish(&shaCtx, computed);
+    mbedtls_sha256_context copy;
+    mbedtls_sha256_init(&copy);
+    mbedtls_sha256_clone(&copy, &shaCtx);
+    mbedtls_sha256_finish(&copy, computed);
+    mbedtls_sha256_free(&copy);
     uint8_t stored[SHA_TRAILER];
     if (file.read(stored, SHA_TRAILER) != static_cast<int>(SHA_TRAILER)) {
       mbedtls_sha256_free(&shaCtx);
@@ -309,137 +314,23 @@ Result validateImageFile(const char* sdPath, size_t partitionSize) {
       file.close();
       return Result::BAD_SHA;
     }
+    mbedtls_sha256_update(&shaCtx, stored, SHA_TRAILER);
   }
 
+  if (fullDigest) mbedtls_sha256_finish(&shaCtx, fullDigest);
   mbedtls_sha256_free(&shaCtx);
   file.close();
   return Result::OK;
 }
 
 namespace {
-constexpr char IDENTITY_PREFIX[] = "INKADEMIC_FW_ID|device=";
-constexpr size_t IDENTITY_SCAN_WINDOW = 256;
-constexpr size_t IDENTITY_DEVICE_MAX = 31;
-constexpr size_t IDENTITY_VERSION_MAX = 63;
-
-bool isDigit(const char c) { return c >= '0' && c <= '9'; }
-
-struct ParsedVersion {
-  int segments[4] = {0, 0, 0, 0};
-  bool valid = false;
-  // 0 = development/unknown pre-release, 1 = release candidate,
-  // 2 = production release. Device suffixes used by local builds are
-  // intentionally treated as production-equivalent.
-  int qualifier = 0;
-  int rcNumber = 0;
-};
-
-bool hasToken(const char* version, const char* token) {
-  if (version == nullptr || token == nullptr) return false;
-  return std::strstr(version, token) != nullptr;
-}
-
-ParsedVersion parseVersion(const char* version) {
-  ParsedVersion parsed;
-  if (version == nullptr || version[0] == '\0') return parsed;
-  const char* p = version;
-  if (*p == 'v' || *p == 'V') ++p;
-  for (size_t i = 0; i < 4; ++i) {
-    if (!isDigit(*p)) return parsed;
-    int value = 0;
-    while (isDigit(*p)) {
-      value = value * 10 + (*p - '0');
-      ++p;
-    }
-    parsed.segments[i] = value;
-    if (*p != '.') break;
-    ++p;
-  }
-  parsed.valid = true;
-  bool hasRc = false;
-  for (const char* marker = version; marker[0] != '\0' && marker[1] != '\0' && marker[2] != '\0'; ++marker) {
-    if (marker[0] == '-' && (marker[1] == 'r' || marker[1] == 'R') &&
-        (marker[2] == 'c' || marker[2] == 'C')) {
-      hasRc = true;
-      marker += 3;
-      // Accept both common spellings: 1.8.0-rc.2 and 1.8.0-rc-2.
-      if (*marker == '.' || *marker == '-') ++marker;
-      while (isDigit(*marker)) {
-        parsed.rcNumber = parsed.rcNumber * 10 + (*marker - '0');
-        ++marker;
-      }
-      break;
-    }
-  }
-  const bool isDevelopment = hasToken(version, "-dev") || hasToken(version, "-debug") || hasToken(version, "+dev");
-  const bool isDeviceBuild = hasToken(version, "-x3-x4") || hasToken(version, "-x4-pro") ||
-                             hasToken(version, "-sticky") || hasToken(version, "-recovery-x4-pro");
-  const bool unknownPrerelease = std::strchr(version, '-') != nullptr && !hasRc && !isDeviceBuild && !isDevelopment;
-  parsed.qualifier = hasRc ? 1 : ((isDevelopment || unknownPrerelease) ? 0 : 2);
-  return parsed;
-}
-
-int compareVersions(const char* left, const char* right) {
-  const ParsedVersion a = parseVersion(left);
-  const ParsedVersion b = parseVersion(right);
-  if (!a.valid || !b.valid) return 0;
-  for (size_t i = 0; i < 4; ++i) {
-    if (a.segments[i] != b.segments[i]) return a.segments[i] > b.segments[i] ? 1 : -1;
-  }
-  if (a.qualifier != b.qualifier) return a.qualifier > b.qualifier ? 1 : -1;
-  if (a.qualifier == 1 && a.rcNumber != b.rcNumber) return a.rcNumber > b.rcNumber ? 1 : -1;
-  return 0;
-}
-
-bool copyField(const std::string& source, size_t start, size_t end, char* output, size_t capacity) {
-  if (output == nullptr || capacity == 0 || end < start || end - start + 1 > capacity) return false;
-  const size_t length = end - start;
-  std::memcpy(output, source.data() + start, length);
-  output[length] = '\0';
-  return true;
-}
-
-bool readEmbeddedIdentity(HalFile& file, char* device, size_t deviceCapacity, char* version, size_t versionCapacity) {
-  if (!file.seek(0)) return false;
-  auto buffer = std::unique_ptr<uint8_t[]>(new (std::nothrow) uint8_t[CHUNK]);
-  if (!buffer) return false;
-
-  std::string window;
-  window.reserve(IDENTITY_SCAN_WINDOW);
-  size_t remaining = file.fileSize();
-  while (remaining > 0) {
-    const size_t want = std::min<size_t>(CHUNK, remaining);
-    const int got = file.read(buffer.get(), want);
-    if (got <= 0 || static_cast<size_t>(got) != want) return false;
-    for (size_t i = 0; i < want; ++i) {
-      window.push_back(static_cast<char>(buffer[i]));
-      if (window.size() > IDENTITY_SCAN_WINDOW) window.erase(0, window.size() - IDENTITY_SCAN_WINDOW);
-      const size_t marker = window.find(IDENTITY_PREFIX);
-      if (marker == std::string::npos) continue;
-      const size_t deviceStart = marker + sizeof(IDENTITY_PREFIX) - 1;
-      const size_t deviceEnd = window.find("|version=", deviceStart);
-      if (deviceEnd == std::string::npos) continue;
-      const size_t versionStart = deviceEnd + sizeof("|version=") - 1;
-      const size_t versionEnd = window.find('|', versionStart);
-      if (versionEnd == std::string::npos) continue;
-      if (!copyField(window, deviceStart, deviceEnd, device, deviceCapacity) ||
-          !copyField(window, versionStart, versionEnd, version, versionCapacity)) {
-        return false;
-      }
-      return true;
-    }
-    remaining -= want;
-    esp_task_wdt_reset();
-    yield();
-  }
-  return false;
-}
-
-bool computeFileSha256(const char* sdPath, uint8_t digest[32]) {
+bool computeFileSha256(const char* sdPath, uint8_t digest[32], firmware_identity::Scanner* identity = nullptr) {
   HalFile file;
   if (!Storage.openFileForRead("FLASH", sdPath, file) || !file) return false;
-  auto buffer = std::unique_ptr<uint8_t[]>(new (std::nothrow) uint8_t[CHUNK]);
+  // One 4 KiB buffer per scan, not per chunk; too large for the task stack.
+  auto buffer = makeUniqueNoThrow<uint8_t[]>(CHUNK);
   if (!buffer) {
+    LOG_ERR("FLASH", "OOM allocating 4 KiB hash buffer");
     file.close();
     return false;
   }
@@ -456,6 +347,8 @@ bool computeFileSha256(const char* sdPath, uint8_t digest[32]) {
       return false;
     }
     mbedtls_sha256_update(&sha, buffer.get(), want);
+    if (identity)
+      for (size_t i = 0; i < want; ++i) identity->feed(static_cast<char>(buffer[i]));
     remaining -= want;
     esp_task_wdt_reset();
     yield();
@@ -466,70 +359,96 @@ bool computeFileSha256(const char* sdPath, uint8_t digest[32]) {
   return true;
 }
 
-bool verifyEd25519FileSignature(const char* imagePath, const char* signaturePath) {
+bool verifyDigestSignature(const uint8_t digest[32], const char* signaturePath) {
   HalFile signature;
-  if (!Storage.openFileForRead("FLASH", signaturePath, signature) || !signature || signature.fileSize() != 64) {
-    if (signature) signature.close();
-    return false;
-  }
+  if (!Storage.openFileForRead("FLASH", signaturePath, signature) || !signature) return false;
   uint8_t rawSignature[64] = {};
-  const bool signatureRead = signature.read(rawSignature, sizeof(rawSignature)) == static_cast<int>(sizeof(rawSignature));
+  const bool ok = signature.fileSize() == sizeof(rawSignature) &&
+                  signature.read(rawSignature, sizeof(rawSignature)) == static_cast<int>(sizeof(rawSignature));
   signature.close();
-  if (!signatureRead) return false;
-
-  uint8_t digest[32] = {};
-  if (!computeFileSha256(imagePath, digest)) return false;
-
-#if defined(HAVE_ED25519) && defined(HAVE_ED25519_VERIFY) && defined(HAVE_ED25519_KEY_IMPORT)
-  ed25519_key key;
-  wc_ed25519_init(&key);
-  const int importResult = wc_ed25519_import_public(inkademic_ota::kEd25519PublicKey,
-                                                     sizeof(inkademic_ota::kEd25519PublicKey), &key);
-  int verified = 0;
-  const int verifyResult = importResult == 0 ? wc_ed25519_verify_msg(rawSignature, sizeof(rawSignature), digest,
-                                                                       sizeof(digest), &verified, &key)
-                                             : -1;
-  wc_ed25519_free(&key);
-  return verifyResult == 0 && verified == 1;
-#else
-  (void)digest;
-  return false;
-#endif
+  return ok && ota_signature::verify(digest, rawSignature, sizeof(rawSignature));
 }
 }  // namespace
 
 Result validateBrowserImageFile(const char* sdPath, size_t partitionSize, const char* expectedDevice,
                                 const char* currentVersion, const char* signaturePath, char* imageDevice,
-                                size_t imageDeviceCapacity, char* imageVersion, size_t imageVersionCapacity) {
-  const Result baseResult = validateImageFile(sdPath, partitionSize);
+                                size_t imageDeviceCapacity, char* imageVersion, size_t imageVersionCapacity,
+                                uint8_t* authenticatedDigest, ValidationPolicy policy) {
+  if (imageDevice && imageDeviceCapacity) imageDevice[0] = '\0';
+  if (imageVersion && imageVersionCapacity) imageVersion[0] = '\0';
+  if (policy == ValidationPolicy::Manual) {
+    // Explicit user choice: integrity/chip/size checks apply, but another
+    // project does not need our identity, version scheme, or signing key.
+    return validateImageFile(sdPath, partitionSize, authenticatedDigest);
+  }
+  uint8_t structuralDigest[32];
+  const Result baseResult = validateImageFile(sdPath, partitionSize, structuralDigest);
   if (baseResult != Result::OK) return baseResult;
 
-  HalFile image;
-  if (!Storage.openFileForRead("FLASH", sdPath, image) || !image) return Result::OPEN_FAIL;
-  const bool identityFound = readEmbeddedIdentity(image, imageDevice, imageDeviceCapacity, imageVersion, imageVersionCapacity);
-  image.close();
-  if (!identityFound) {
-    LOG_ERR("FLASH", "browser validation: missing INKademic identity marker");
+  uint8_t digest[32];
+  firmware_identity::Scanner identity;
+  // Identity and signed digest come from the same read, not two independently
+  // reopenable files. The caller carries this digest into the flash operation.
+  if (!computeFileSha256(sdPath, digest, &identity)) return Result::READ_FAIL;
+  if (std::memcmp(digest, structuralDigest, sizeof(digest)) != 0) return Result::BAD_SHA;
+  if (!identity.found() || !imageDevice || !imageVersion || std::strlen(identity.device()) >= imageDeviceCapacity ||
+      std::strlen(identity.version()) >= imageVersionCapacity)
     return Result::BAD_TARGET;
-  }
+  std::strcpy(imageDevice, identity.device());
+  std::strcpy(imageVersion, identity.version());
   if (expectedDevice == nullptr || std::strcmp(imageDevice, expectedDevice) != 0) {
-    LOG_ERR("FLASH", "browser validation: target=%s expected=%s", imageDevice, expectedDevice ? expectedDevice : "none");
+    LOG_ERR("FLASH", "browser validation: target=%s expected=%s", imageDevice,
+            expectedDevice ? expectedDevice : "none");
     return Result::BAD_TARGET;
   }
-  if (currentVersion == nullptr || compareVersions(imageVersion, currentVersion) <= 0) {
+  if (currentVersion == nullptr || firmware_version::compareForUpdate(imageVersion, currentVersion) <= 0) {
     LOG_ERR("FLASH", "browser validation: candidate=%s current=%s", imageVersion,
             currentVersion ? currentVersion : "none");
     return Result::BAD_VERSION;
   }
   if (signaturePath == nullptr || !Storage.exists(signaturePath)) return Result::SIGNATURE_MISSING;
-  if (!verifyEd25519FileSignature(sdPath, signaturePath)) {
+  if (!verifyDigestSignature(digest, signaturePath)) {
     LOG_ERR("FLASH", "browser validation: Ed25519 signature rejected");
     return Result::SIGNATURE_INVALID;
   }
+  if (authenticatedDigest) std::memcpy(authenticatedDigest, digest, 32);
   return Result::OK;
 }
 
-Result flashFromSdPath(const char* sdPath, ProgressCb onProgress, void* ctx, bool alreadyValidated) {
+bool verifyPartitionDigest(const esp_partition_t* partition, size_t size, const uint8_t expected[32]) {
+  if (!partition || !expected || size > partition->size) return false;
+  // One reusable 4 KiB buffer: too large for the task stack, released on return.
+  auto buffer = makeUniqueNoThrow<uint8_t[]>(CHUNK);
+  if (!buffer) {
+    LOG_ERR("FLASH", "OOM during flash readback");
+    return false;
+  }
+  mbedtls_sha256_context sha;
+  mbedtls_sha256_init(&sha);
+  mbedtls_sha256_starts(&sha, 0);
+  for (size_t offset = 0; offset < size;) {
+    const size_t count = std::min(CHUNK, size - offset);
+    esp_task_wdt_reset();
+    if (esp_partition_read(partition, offset, buffer.get(), count) != ESP_OK) {
+      mbedtls_sha256_free(&sha);
+      LOG_ERR("FLASH", "Flash readback failed");
+      return false;
+    }
+    mbedtls_sha256_update(&sha, buffer.get(), count);
+    offset += count;
+    esp_task_wdt_reset();
+    delay(1);
+  }
+  uint8_t actual[32];
+  mbedtls_sha256_finish(&sha, actual);
+  mbedtls_sha256_free(&sha);
+  const bool matches = std::memcmp(actual, expected, 32) == 0;
+  if (!matches) LOG_ERR("FLASH", "Written firmware differs from validated image");
+  return matches;
+}
+
+Result flashFromSdPath(const char* sdPath, ProgressCb onProgress, void* ctx, bool alreadyValidated,
+                       const uint8_t* authenticatedDigest) {
   // Resolve destination first so we can size-check during validation. The full image-integrity
   // pass below verifies header, segment table, XOR checksum and SHA256 trailer end-to-end before
   // we touch otadata, so a truncated/corrupted .bin can never become the next boot target.
@@ -539,17 +458,18 @@ Result flashFromSdPath(const char* sdPath, ProgressCb onProgress, void* ctx, boo
     return Result::NO_PARTITION;
   }
 
-  // When the caller already ran validateImageFile() against this same partition
-  // size (e.g. SdFirmwareUpdateActivity validates before the confirmation
-  // prompt), skip the redundant integrity scan. We still keep the partition
-  // lookup so the rest of the flashing path stays unchanged.
-  if (!alreadyValidated) {
-    const Result validateRes = validateImageFile(sdPath, dest->size);
+  // A prior validation is reusable only with its full-file digest. The final
+  // readback binds the flashed bytes to that validation, even if SD changes.
+  uint8_t expectedDigest[32];
+  if (!alreadyValidated || !authenticatedDigest) {
+    const Result validateRes = validateImageFile(sdPath, dest->size, expectedDigest);
     if (validateRes != Result::OK) {
       LOG_ERR("FLASH", "image validation failed: %s", resultName(validateRes));
       return validateRes;
     }
   }
+
+  if (authenticatedDigest) std::memcpy(expectedDigest, authenticatedDigest, sizeof(expectedDigest));
 
   HalFile file;
   if (!Storage.openFileForRead("FLASH", sdPath, file) || !file) {
@@ -558,10 +478,15 @@ Result flashFromSdPath(const char* sdPath, ProgressCb onProgress, void* ctx, boo
   }
 
   const size_t firmwareSize = file.fileSize();
+  // Recheck even when a browser caller validated before reopening the file.
+  if (firmwareSize < MIN_FIRMWARE_SIZE || firmwareSize > dest->size) {
+    file.close();
+    return Result::BAD_SIZE;
+  }
   LOG_INF("FLASH", "src=%s size=%u dest=%s @0x%x partsize=%u", sdPath, static_cast<unsigned>(firmwareSize), dest->label,
           static_cast<unsigned>(dest->address), static_cast<unsigned>(dest->size));
 
-  auto buffer = std::unique_ptr<uint8_t[]>(new (std::nothrow) uint8_t[CHUNK]);
+  auto buffer = makeUniqueNoThrow<uint8_t[]>(CHUNK);
   if (!buffer) {
     LOG_ERR("FLASH", "OOM");
     file.close();
@@ -620,6 +545,12 @@ Result flashFromSdPath(const char* sdPath, ProgressCb onProgress, void* ctx, boo
     delay(1);
   }
   file.close();
+
+  buffer.reset();  // Release the write buffer before allocating the readback buffer.
+
+  // Check actual flash contents against the authenticated bytes before changing
+  // boot selection. This also catches SD changes during validation/write.
+  if (!verifyPartitionDigest(dest, firmwareSize, expectedDigest)) return Result::BAD_SHA;
 
   if (!ota_boot::switchTo(dest)) {
     LOG_ERR("FLASH", "otadata switch failed");

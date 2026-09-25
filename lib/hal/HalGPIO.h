@@ -60,6 +60,9 @@ class HalGPIO {
   bool wasAnyReleased() const;
   unsigned long getHeldTime() const;
   unsigned long getPowerButtonHeldTime() const;
+  // Read physical contacts before debounce commits them. Used to break the
+  // low-power idle delay early so a short press still receives two samples.
+  bool rawInputActive();
 #if INKADEMIC_APP_CAP_TOUCH
   bool hasTouch() const;
   // Capacitive home key under the bezel, reported by the touch controller

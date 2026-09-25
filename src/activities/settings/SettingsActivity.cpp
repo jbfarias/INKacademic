@@ -5,6 +5,7 @@
 #include <HalGPIO.h>
 #include <Logging.h>
 #include <Memory.h>
+#include <WiFi.h>
 
 #include <algorithm>
 #include <cctype>
@@ -12,9 +13,9 @@
 #include <cstring>
 #include <iterator>
 
+#include "AnnotationTagManagerActivity.h"
 #include "AppCapabilities.h"
 #include "AppVersion.h"
-#include "AnnotationTagManagerActivity.h"
 #include "BackupStatsActivity.h"
 #include "ButtonRemapActivity.h"
 #include "ClearCacheActivity.h"
@@ -958,7 +959,23 @@ void SettingsActivity::toggleCurrentSetting() {
         startActivityForResult(std::make_unique<OpdsServerListActivity>(renderer, mappedInput), resultHandler);
         break;
       case SettingAction::Network:
-        startActivityForResult(std::make_unique<WifiSelectionActivity>(renderer, mappedInput, false), resultHandler);
+        startActivityForResult(std::make_unique<WifiSelectionActivity>(renderer, mappedInput, false),
+                               [this](const ActivityResult&) {
+                                 SETTINGS.saveToFile();
+                                 // A successful connection deliberately leaves Wi-Fi up for a parent
+                                 // network activity, but Settings has no such owner. Reboot after
+                                 // shutting it down to release the driver's fragmented heap and return
+                                 // to the same screen.
+                                 if (WiFi.getMode() == WIFI_MODE_NULL) {
+                                   requestUpdate();
+                                   return;
+                                 }
+                                 WiFi.disconnect(false);
+                                 delay(30);
+                                 WiFi.mode(WIFI_OFF);
+                                 RenderLock lock(*this);
+                                 silentRestartToSettings();
+                               });
         break;
       case SettingAction::BackupStats:
         startActivityForResult(std::make_unique<BackupStatsActivity>(renderer, mappedInput), resultHandler);

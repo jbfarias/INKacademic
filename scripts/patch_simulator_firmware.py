@@ -21,20 +21,23 @@ def patch_simulator_firmware(source, target, env):
 
     source_text = simulator_source.read_text()
     stale_case = '  case Result::WRONG_BOARD:\n    return "WRONG_BOARD";\n'
-    stale_signature = (
-        "Result flashFromSdPath(const char *, ProgressCb onProgress, void *ctx) {"
-    )
-    if stale_case not in source_text and stale_signature not in source_text:
-        patch_simulator_ota(env)
-        return
-
-    patched_text = source_text.replace(stale_case, "").replace(
-        stale_signature,
+    patched_text = source_text.replace(stale_case, "")
+    patched_text = patched_text.replace(
+        "Result flashFromSdPath(const char *, ProgressCb onProgress, void *ctx) {",
         "Result flashFromSdPath(const char *, ProgressCb onProgress, void *ctx, "
-        "bool) {",
+        "bool, const uint8_t *) {",
+    ).replace(
+        "Result flashFromSdPath(const char *, ProgressCb onProgress, void *ctx, bool) {",
+        "Result flashFromSdPath(const char *, ProgressCb onProgress, void *ctx, "
+        "bool, const uint8_t *) {",
     )
-    simulator_source.write_text(patched_text)
-    print(f"Patched simulator flash result compatibility: {simulator_source}")
+    patched_text = patched_text.replace(
+        "Result validateImageFile(const char *, size_t) {",
+        "Result validateImageFile(const char *, size_t, uint8_t *) {",
+    )
+    if patched_text != source_text:
+        simulator_source.write_text(patched_text)
+        print(f"Patched simulator flash API compatibility: {simulator_source}")
     patch_simulator_ota(env)
 
 
@@ -47,6 +50,14 @@ def patch_simulator_ota(env):
 
     ota_text = simulator_ota_source.read_text()
     patched_ota_text = ota_text.replace("#ifdef CROSSINK_VERSION", "#ifdef INKADEMIC_VERSION")
+    if "OtaUpdater::loadSavedSource()" not in patched_ota_text:
+        marker = "OtaUpdater::OtaUpdaterError OtaUpdater::checkForUpdate() {"
+        saved_source_stub = (
+            "OtaUpdater::OtaUpdaterError OtaUpdater::loadSavedSource() {\n"
+            "  return NO_UPDATE;\n"
+            "}\n\n"
+        )
+        patched_ota_text = patched_ota_text.replace(marker, saved_source_stub + marker)
     if patched_ota_text != ota_text:
         simulator_ota_source.write_text(patched_ota_text)
         print(f"Patched simulator OTA version guard: {simulator_ota_source}")

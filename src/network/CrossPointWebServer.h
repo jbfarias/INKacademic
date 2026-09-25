@@ -9,6 +9,8 @@
 #include <string>
 #include <vector>
 
+#include "network/FirmwareRequestPolicy.h"
+
 class OtaUpdater;
 
 // Structure to hold file information
@@ -95,12 +97,16 @@ class CrossPointWebServer {
   void handleRoot() const;
   void handleFirmwarePage() const;
   void handleFirmwareStatus() const;
+  bool firmwareRequestAllowed() const;
+  bool requireFirmwareRequest() const;
   void handleFirmwareUpload();
   void handleFirmwareUploadPost();
   void handleFirmwareSignatureUpload();
   void handleFirmwareSignatureUploadPost();
   void handleFirmwareCatalog();
   void handleFirmwareOfficialDownload();
+  void handleFirmwareManualDownload();
+  void handleFirmwareSource();
   void handleFirmwareInstall();
   void handleFirmwareCancel();
   void processPendingFirmwareInstall();
@@ -194,11 +200,14 @@ class CrossPointWebServer {
   static constexpr const char* FIRMWARE_STATE_PATH = "/.inkademic-firmware.state";
   static constexpr const char* FIRMWARE_DIAGNOSTIC_PATH = "/.inkademic-firmware.diagnostic";
 
+  firmware_request::UploadRequest firmwareRequest;
+  firmware_request::UploadRequest signatureRequest;
   FirmwareState firmwareState = FirmwareState::IDLE;
   HalFile firmwareSignatureFile;
   size_t firmwareSignatureReceived = 0;
   bool firmwareSignatureActive = false;
   bool firmwareInstallPending = false;
+  bool firmwareManual = false;
   size_t firmwareSize = 0;
   size_t firmwareWritten = 0;
   size_t firmwareTotal = 0;
@@ -207,15 +216,15 @@ class CrossPointWebServer {
   String firmwareCandidateVersion;
   String firmwareCandidateSha256;
   String firmwareError;
-  bool firmwareOfficialDownloadPending = false;
+  bool firmwareDownloadPending = false;
   std::unique_ptr<OtaUpdater> officialUpdater;
+  std::unique_ptr<OtaUpdater> manualUpdater;
 
   static const char* firmwareStateName(FirmwareState state);
   void restoreFirmwareState();
   void writeFirmwareState(const char* state, const char* detail = nullptr) const;
   void resetFirmwareStaging(bool removeReadyImage);
-  bool finalizeFirmwareCandidate(const char* imagePath, const char* signaturePath, size_t imageSize,
-                                 bool fromOfficial);
+  bool finalizeFirmwareCandidate(const char* imagePath, const char* signaturePath, size_t imageSize, bool fromOfficial);
   bool hasEnoughHeapForFirmwareUpdate(String& reason) const;
   void processPendingFirmwareDownload();
   static void firmwareProgress(size_t written, size_t total, void* context);
